@@ -218,6 +218,14 @@ const SUBSCRIBERS: usize = 6;
 /// Latest decoded state. Subscribe with `SNAPSHOT.receiver()`.
 pub static SNAPSHOT: Watch<CriticalSectionRawMutex, Snapshot, SUBSCRIBERS> = Watch::new();
 
+/// A [`SNAPSHOT`] subscription, as held for the lifetime of a task.
+pub type SnapshotReceiver =
+    embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, Snapshot, SUBSCRIBERS>;
+
+/// An [`OUTCOMES`] subscription, as held for the lifetime of a task.
+pub type OutcomeReceiver =
+    embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, CommandReport, SUBSCRIBERS>;
+
 /// Commands into the bus master. At most one is applied per cycle.
 pub static COMMANDS: Channel<CriticalSectionRawMutex, Command, 4> = Channel::new();
 

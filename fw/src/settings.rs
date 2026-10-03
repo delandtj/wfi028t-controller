@@ -13,13 +13,14 @@
 //! |---|---|---|
 //! | 0 | 16 | bus configuration, [`modbus_sniffer_core::encode_bus_record`] |
 //! | 16 | 8 | operating mode, [`encode_mode_record`] |
+//! | 24 | 112 | MQTT broker, [`crate::mqtt::config::encode_record`] |
 //!
 //! A write erases the sector and lays all records down again, so the in-memory
 //! copy of the others has to be current - which is why [`init`] keeps what it
 //! read. Anything else (erased flash, a record from a future version, bit rot
 //! caught by the CRC) reads back as "no setting" and the firmware falls back to
-//! [`crate::DEFAULT_BUS`] and [`OpMode::Listen`] - the safe mode, which never
-//! transmits.
+//! [`crate::DEFAULT_BUS`], [`OpMode::Listen`] - the safe mode, which never
+//! transmits - and the build-time MQTT configuration.
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -32,6 +33,7 @@ use modbus_sniffer_core as sniffer;
 use sniffer::BusConfig;
 
 use crate::master::OpMode;
+use crate::mqtt::{self, config as mqtt_config, Stored};
 
 /// The smallest erasable unit of the flash chip.
 const SECTOR: u32 = FlashStorage::SECTOR_SIZE;
@@ -42,6 +44,9 @@ const MODE_OFFSET: u32 = sniffer::BUS_RECORD_LEN as u32;
 
 /// Size of the on-flash mode record. A multiple of the flash word size (4).
 const MODE_RECORD_LEN: usize = 8;
+
+/// Offset of the MQTT broker record, right after the mode record.
+const MQTT_OFFSET: u32 = MODE_OFFSET + MODE_RECORD_LEN as u32;
 
 /// Magic at the start of the mode record: "WCM1" (Wfi Controller Mode, rev 1).
 const MODE_RECORD_MAGIC: u32 = u32::from_le_bytes(*b"WCM1");
@@ -90,6 +95,7 @@ struct Store {
     /// others (an erase takes the whole sector).
     bus: BusConfig,
     mode: OpMode,
+    broker: Stored,
 }
 
 /// Guards the one flash peripheral. An async mutex, because the command
@@ -99,6 +105,9 @@ static STORE: Mutex<CriticalSectionRawMutex, Option<Store>> = Mutex::new(None);
 
 /// Take ownership of the flash peripheral, locate the settings area and return
 /// the stored bus configuration and operating mode (or the defaults).
+///
+/// The stored MQTT configuration is handed to [`crate::mqtt::load`] here
+/// rather than returned, because `main` has nothing to do with it.
 ///
 /// Call once, from `main`, before anything else touches flash.
 pub async fn init(flash: esp_hal::peripherals::FLASH<'static>) -> (BusConfig, OpMode) {
@@ -118,6 +127,7 @@ pub async fn init(flash: esp_hal::peripherals::FLASH<'static>) -> (BusConfig, Op
 
     let mut bus = crate::DEFAULT_BUS;
     let mut mode = OpMode::Listen;
+    let mut broker = Stored::Unset;
     if let Some(entry) = area {
         let mut region = entry.as_flash_region(&mut flash);
         let mut raw = [0u8; sniffer::BUS_RECORD_LEN];
@@ -132,6 +142,10 @@ pub async fn init(flash: esp_hal::peripherals::FLASH<'static>) -> (BusConfig, Op
                 mode = stored;
             }
         }
+        let mut raw = [0u8; mqtt_config::RECORD_LEN];
+        if region.read(MQTT_OFFSET, &mut raw).is_ok() {
+            broker = mqtt_config::decode_record(&raw);
+        }
     }
 
     *STORE.lock().await = Some(Store {
@@ -139,31 +153,47 @@ pub async fn init(flash: esp_hal::peripherals::FLASH<'static>) -> (BusConfig, Op
         area,
         bus,
         mode,
+        broker,
     });
+    mqtt::load(broker);
     (bus, mode)
 }
 
 /// Persist a bus configuration. The `Err` payload is protocol-visible text.
 pub async fn store_bus(bus: BusConfig) -> Result<(), &'static str> {
-    write_records(Some(bus), None).await
+    write_records(Some(bus), None, None).await
 }
 
 /// Persist the operating mode. The `Err` payload is protocol-visible text.
 pub async fn store_mode(mode: OpMode) -> Result<(), &'static str> {
-    write_records(None, Some(mode)).await
+    write_records(None, Some(mode), None).await
 }
 
-/// Erase the sector and lay every record down again, with `bus` and/or
-/// `mode` replaced.
-async fn write_records(bus: Option<BusConfig>, mode: Option<OpMode>) -> Result<(), &'static str> {
+/// Persist the MQTT broker setting. The `Err` payload is protocol-visible
+/// text.
+pub async fn store_broker(broker: Stored) -> Result<(), &'static str> {
+    write_records(None, None, Some(broker)).await
+}
+
+/// Erase the sector and lay every record down again, with `bus`, `mode`
+/// and/or `broker` replaced.
+async fn write_records(
+    bus: Option<BusConfig>,
+    mode: Option<OpMode>,
+    broker: Option<Stored>,
+) -> Result<(), &'static str> {
     let mut guard = STORE.lock().await;
     let store = guard.as_mut().ok_or("settings store not initialised")?;
     let entry = store.area.ok_or("no nvs data partition to save into")?;
 
     let next_bus = bus.unwrap_or(store.bus);
     let next_mode = mode.unwrap_or(store.mode);
+    let next_broker = broker.unwrap_or(store.broker);
     let bus_record = sniffer::encode_bus_record(next_bus);
     let mode_record = encode_mode_record(next_mode);
+    // `Stored::Unset` has no record: an erased slot is what it means, so
+    // nothing is written there and the build-time default applies again.
+    let broker_record = mqtt_config::encode_record(next_broker);
 
     let mut region = entry.as_flash_region(&mut store.flash);
     region.erase(0, SECTOR).map_err(|_| "flash erase failed")?;
@@ -173,8 +203,14 @@ async fn write_records(bus: Option<BusConfig>, mode: Option<OpMode>) -> Result<(
     region
         .write(MODE_OFFSET, &mode_record)
         .map_err(|_| "flash write failed")?;
+    if let Some(record) = broker_record {
+        region
+            .write(MQTT_OFFSET, &record)
+            .map_err(|_| "flash write failed")?;
+    }
 
     store.bus = next_bus;
     store.mode = next_mode;
+    store.broker = next_broker;
     Ok(())
 }

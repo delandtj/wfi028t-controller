@@ -15,15 +15,19 @@
 //! | `set p05 on\|off` | stop once the target is reached |
 //! | `set mode heat\|cool\|auto` | operating mode of the heat pump |
 //! | `set p01..p04 <n>` | setpoints and hysteresis, whole degrees |
+//! | `mqtt` | report the broker configuration and connection state |
+//! | `mqtt host <ip> [port]` | point at a broker (persisted, overrides the build-time one) |
+//! | `mqtt user <u> <p>` | broker credentials (persisted, never echoed back) |
+//! | `mqtt off` | no MQTT, even if the image was built with a broker |
 //!
 //! `set` exists to drive the heat pump from a bench terminal before the MQTT
 //! task is written; it goes through the same [`master::COMMANDS`] queue and the
 //! same validation, and its reply is the real [`master::CommandOutcome`].
 //!
 //! The `status` line keeps the sniffer's fields and order and gains
-//! `mode=`, `link=` and the bus-master counters at the
+//! `mode=`, `link=`, the bus-master counters and the `mqtt_*` fields at the
 //! end, so the capture daemon and analyzer (which treat `# ` lines as opaque
-//! status text) are unaffected.
+//! status text) are unaffected. The MQTT password is never in it.
 
 use core::fmt::Write as _;
 
@@ -36,6 +40,7 @@ use modbus_sniffer_core as sniffer;
 use sniffer::{Command, Line};
 
 use crate::master::{self, CommandReport, OpMode};
+use crate::mqtt;
 
 /// How long a `set` command waits for its outcome before answering "queued".
 ///
@@ -137,6 +142,9 @@ pub async fn execute(text: &str) -> Line {
     if keyword.eq_ignore_ascii_case("set") {
         return set_command(rest).await;
     }
+    if keyword.eq_ignore_ascii_case("mqtt") {
+        return mqtt_command(rest).await;
+    }
 
     let command = match sniffer::parse_command(text) {
         Ok(command) => command,
@@ -144,7 +152,7 @@ pub async fn execute(text: &str) -> Line {
             // The core parser's "unknown command" list does not know about the
             // two commands above; say the whole list.
             if reason.starts_with("unknown command") {
-                return reply_err("unknown command (bus, status, note, mode, set)");
+                return reply_err("unknown command (bus, status, note, mode, set, mqtt)");
             }
             return reply_err(reason);
         }
@@ -291,6 +299,37 @@ fn status_reply() -> Line {
         );
     }
 
+    // MQTT last, appended the way the mode field was: the host parser reads
+    // `# ` lines as opaque text, so new fields at the end are free. The
+    // password is deliberately not among them.
+    let _ = write!(reply, " mqtt={}", mqtt::connection().as_str());
+    match mqtt::effective() {
+        Some(broker) => {
+            let [a, b, c, d] = broker.host();
+            let _ = write!(
+                reply,
+                " mqtt_host={a}.{b}.{c}.{d}:{} mqtt_user={}",
+                broker.port(),
+                if broker.user().is_empty() {
+                    "-"
+                } else {
+                    broker.user()
+                },
+            );
+        }
+        None => {
+            let _ = write!(reply, " mqtt_host=- mqtt_user=-");
+        }
+    }
+    let _ = write!(
+        reply,
+        " mqtt_published={} mqtt_received={} mqtt_dropped={} mqtt_failures={}",
+        mqtt::published(),
+        mqtt::received(),
+        mqtt::dropped(),
+        mqtt::failures(),
+    );
+
     if reply.push_str("\r\n").is_err() {
         return reply_err("status line too long");
     }
@@ -321,6 +360,96 @@ async fn mode_command(rest: &str) -> Line {
         }
         Err(reason) => reply_err(reason),
     }
+}
+
+// ---------------------------------------------------------------------------
+// mqtt
+// ---------------------------------------------------------------------------
+
+/// `mqtt [host <ip> [port] | user <name> <password> | off]`.
+///
+/// A change takes effect at once (the MQTT task drops the connection and
+/// reconnects) and is then persisted, like the `bus` command: a board with no
+/// settings partition still honours it for this session and says that it did
+/// not stick. The password is never echoed, here or in `status`.
+async fn mqtt_command(rest: &str) -> Line {
+    let request = match mqtt::config::parse_request(rest) {
+        Ok(request) => request,
+        Err(reason) => return reply_err(reason),
+    };
+
+    let next = match request {
+        mqtt::Request::Report => return mqtt_report(),
+        mqtt::Request::Off => mqtt::Stored::Off,
+        mqtt::Request::Address(host, port) => {
+            // Keep whatever credentials are in force, so `mqtt host` after
+            // `mqtt user` does not silently drop the password.
+            let broker = match mqtt::effective() {
+                Some(current) => current.with_address(host, port),
+                None => match mqtt::Broker::new(host, port, "", "") {
+                    Some(broker) => broker,
+                    None => return reply_err("broker configuration rejected"),
+                },
+            };
+            mqtt::Stored::On(broker)
+        }
+        mqtt::Request::Credentials(user, pass) => {
+            let Some(current) = mqtt::effective() else {
+                return reply_err("no broker address yet (try: mqtt host <ip>)");
+            };
+            match current.with_credentials(user, pass) {
+                Some(broker) => mqtt::Stored::On(broker),
+                None => return reply_err("credentials too long"),
+            }
+        }
+    };
+
+    mqtt::configure(next);
+    if let Err(reason) = crate::settings::store_broker(next).await {
+        return reply_err(reason);
+    }
+    mqtt_report()
+}
+
+/// The broker configuration and connection state, without the password.
+fn mqtt_report() -> Line {
+    // Where the configuration in force comes from: the image, or this
+    // command (which is what the flash record holds).
+    let source = if matches!(mqtt::stored(), mqtt::Stored::Unset) {
+        "build"
+    } else {
+        "command"
+    };
+    let mut line = Line::new();
+    match mqtt::effective() {
+        Some(broker) => {
+            let [a, b, c, d] = broker.host();
+            let _ = write!(
+                line,
+                "mqtt {} host={a}.{b}.{c}.{d}:{} user={} password={} source={source}",
+                mqtt::connection().as_str(),
+                broker.port(),
+                if broker.user().is_empty() {
+                    "-"
+                } else {
+                    broker.user()
+                },
+                if broker.pass_opt().is_some() {
+                    "set"
+                } else {
+                    "unset"
+                },
+            );
+        }
+        None => {
+            let _ = write!(
+                line,
+                "mqtt {} host=- source={source}",
+                mqtt::connection().as_str()
+            );
+        }
+    }
+    reply_ok(format_args!("{line}"))
 }
 
 // ---------------------------------------------------------------------------

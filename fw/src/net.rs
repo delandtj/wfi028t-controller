@@ -6,6 +6,8 @@
 //!   if the AP disappears, and samples the RSSI while the link is up.
 //! - [`link_task`] watches the DHCP lease and publishes the `# wifi connected
 //!   ip=...` / `# wifi disconnected` status lines into the shared line ring.
+//! - [`crate::mqtt`]'s task is started from here too, because this is where
+//!   the stack handle is; it waits for the DHCP lease on its own.
 //! - [`tcp_task`] is the line server on [`TCP_PORT`]. It keeps TWO sockets so a
 //!   new connection can always be accepted while one is in use: the fresh
 //!   connection then replaces the old one. That is what stops a half-dead TCP
@@ -48,9 +50,9 @@ pub const TCP_PORT: u16 = 4000;
 /// is how a capture ends up pointed at the wrong device.
 const HOSTNAME: &str = "wfi-controller";
 
-/// Sockets the stack has to manage: the two line-server sockets and the DHCP
-/// client.
-const SOCKETS: usize = 3;
+/// Sockets the stack has to manage: the two line-server sockets, the MQTT
+/// client's socket, and the DHCP client.
+const SOCKETS: usize = 4;
 
 /// Per-socket buffers. The RX buffer only ever carries short commands; the TX
 /// buffer wants room so a replay burst is not written one segment at a time.
@@ -125,6 +127,7 @@ pub fn start(
     spawner.spawn(wifi_task(controller).unwrap());
     spawner.spawn(link_task(stack).unwrap());
     spawner.spawn(tcp_task(stack).unwrap());
+    crate::mqtt::start(spawner, stack);
     true
 }
 

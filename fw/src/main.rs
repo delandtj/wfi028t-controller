@@ -26,8 +26,9 @@
 //! | [`master`] | state, command queue and mode for everyone else |
 //! | [`cmd`] | the line interface on both transports |
 //! | [`net`] | WiFi, DHCP, TCP 4000 |
+//! | [`mqtt`] | MQTT 3.1.1 client and Home Assistant discovery |
 //! | [`led`] | status LED |
-//! | [`settings`] | bus configuration and mode in flash |
+//! | [`settings`] | bus configuration, mode and MQTT broker in flash |
 //!
 //! Polling does not wait for WiFi: the bus task is spawned before the radio and
 //! keeps running whatever the network does (ADR, "Fails safe"). MQTT is a
@@ -79,6 +80,7 @@ use sniffer::{BusConfig, BusFormat, Chunk, Line, Marker, SnifferBus};
 mod cmd;
 mod led;
 mod master;
+mod mqtt;
 mod net;
 mod settings;
 
