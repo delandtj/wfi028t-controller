@@ -2,7 +2,7 @@
 
 **Status**: Accepted
 **Date**: 2026-10-03
-**Updated**: 2026-10-03 (review asks settled: MQTT, core as path dependency, wall display dropped)
+**Updated**: 2026-10-03 (review asks settled: MQTT, core as path dependency, wall display dropped; component 3 moved to MQTT 5 via rust-mqtt 0.6)
 
 ---
 
@@ -115,10 +115,20 @@ master before raising E09.
      decoded status + settings + link state).
 
 3. **MQTT + HA discovery** (`fw/src/mqtt.rs`)
-   - MQTT 3.1.1 client over embassy-net TCP, hand-rolled (`fw/src/mqtt/`):
-     rust-mqtt 0.6 is MQTT 5 only, its last 3.1.1 release is on an older
-     embedded-io-async, and minimq is MQTT 5 + serde. QoS 0 publish/subscribe,
-     retain, LWT and ping are all that is needed.
+   - MQTT 5 over embassy-net TCP through rust-mqtt 0.6, which replaced a
+     hand-rolled 3.1.1 client: 3.1.1 was an unneeded constraint, because the
+     broker is Mosquitto (the HA add-on) and speaks v5. rust-mqtt 0.6 is v5
+     only and sits on embedded-io-async 0.7 + heapless 0.9, which is exactly
+     what embassy-net 0.9 wants, so it drops in and 500 lines of packet
+     encoding stop being ours to own. QoS 0 publish/subscribe, retain, LWT
+     and ping are all that is used; the `alloc` buffer provider (esp-alloc is
+     already up for esp-radio) over the `bump` one, because bump hands back
+     slices that an `unsafe reset()` invalidates. A maximum packet size in
+     CONNECT bounds what one received packet can allocate. Cost: about 67 KB
+     of `.text`.
+   - The modules around it stayed: the entity table and discovery payloads
+     (`entity.rs`), the state document (`json.rs`) and the broker
+     configuration (`config.rs`) are pure and host-tested.
    - On connect: publish retained discovery configs for every entity, the
      availability topic, then state.
    - State publishing: on change, plus a full refresh every 60 s.
@@ -288,9 +298,12 @@ this bus.
 - **Status bits** (compressor, defrost, faults): default is "raw word sensors
   plus confirmed bits only"; add entities as the multi-day capture confirms
   them.
-- **MQTT and OTA crates**: MQTT ended up hand-rolled (see component 3). OTA:
-  default the esp-bootloader OTA support; pivot if it does not build against
-  esp-hal 1.2. Flash is ~500 KB of .text already, so check the two-slot fit.
+- **MQTT and OTA crates**: MQTT is MQTT 5 via rust-mqtt 0.6 (see component 3).
+  It first went in hand-rolled against 3.1.1; that was dropped once it was
+  clear Mosquitto speaks v5, so the only protocol code left is ours by
+  choice. OTA: default the esp-bootloader OTA support; pivot if it does not
+  build against esp-hal 1.2. Flash is ~565 KB of .text already, so check the
+  two-slot fit.
 
 ### The mechanical work
 - Register model module with unit tests from captured frames.

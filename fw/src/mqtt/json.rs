@@ -12,20 +12,19 @@
 //!
 //! The firmware crate only builds for `riscv32imac-unknown-none-elf`, so
 //! `cargo test -p wfi-controller-fw` cannot run (a `no_std` binary has no
-//! `test` crate). The tests in this module and in [`super::entity`],
-//! [`super::proto`] and [`super::config`] are pure and were run on the host
-//! through a throwaway harness crate that includes the four files by path:
+//! `test` crate). The tests in this module and in [`super::entity`] and
+//! [`super::config`] are pure and were run on the host through a throwaway
+//! harness crate that includes the three files by path:
 //!
 //! ```text
 //! # Cargo.toml: heapless = "0.8", hp-model = { path = ".../hp-model" }
-//! #[path = ".../fw/src/mqtt/proto.rs"]  pub mod proto;
 //! #[path = ".../fw/src/mqtt/entity.rs"] pub mod entity;
 //! #[path = ".../fw/src/mqtt/json.rs"]   pub mod json;
 //! #[path = ".../fw/src/mqtt/config.rs"] pub mod config;
 //! ```
 //!
-//! `cargo test` in that harness runs them unchanged (29 tests). Nothing in
-//! these four modules may therefore refer to `crate::` or to anything
+//! `cargo test` in that harness runs them unchanged (21 tests). Nothing in
+//! these three modules may therefore refer to `crate::` or to anything
 //! hardware-bound - which is also what keeps them reviewable on their own.
 
 use core::fmt::Write;

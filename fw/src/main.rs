@@ -26,7 +26,7 @@
 //! | [`master`] | state, command queue and mode for everyone else |
 //! | [`cmd`] | the line interface on both transports |
 //! | [`net`] | WiFi, DHCP, TCP 4000 |
-//! | [`mqtt`] | MQTT 3.1.1 client and Home Assistant discovery |
+//! | [`mqtt`] | MQTT 5 client and Home Assistant discovery |
 //! | [`led`] | status LED |
 //! | [`settings`] | bus configuration, mode and MQTT broker in flash |
 //!
@@ -128,9 +128,11 @@ pub const DEFAULT_BUS: BusConfig = BusConfig {
     format: BusFormat::N1,
 };
 
-/// Heap for esp-radio: the WiFi driver's buffers and the RTOS task stacks it
-/// creates. The radio needs a few tens of KB; the rest of the firmware never
-/// allocates.
+/// Heap for esp-radio and the MQTT client: the WiFi driver's buffers and the
+/// RTOS task stacks it creates, plus the variable-length fields of one
+/// received MQTT packet at a time ([`mqtt`], `AllocBuffer`). The radio needs a
+/// few tens of KB; MQTT needs at most [`mqtt`]'s packet limit, briefly, and
+/// nothing else in this firmware allocates.
 const HEAP_SIZE: usize = 96 * 1024;
 
 /// The token that marks our own transmissions in the capture stream.

@@ -27,5 +27,6 @@ heapless = "0.8.0"
 heapless09 = { version = "0.9", package = "heapless", default-features = false }
 hp-model = { version = "0.1.0", path = "../hp-model" }
 modbus-sniffer-core = { version = "0.1.0", path = "../../stm32-modbus-sniffer/core" }
+rust-mqtt = { version = "0.6", default-features = false, features = ["v5", "alloc"] }
 smart-leds = "0.4.0"
 static_cell = "2"

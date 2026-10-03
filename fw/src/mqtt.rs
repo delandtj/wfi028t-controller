@@ -1,4 +1,4 @@
-//! MQTT 3.1.1 client and Home Assistant discovery: the ADR's component 3.
+//! MQTT 5 client and Home Assistant discovery: the ADR's component 3.
 //!
 //! One task, one TCP socket, one retained JSON document. It subscribes to the
 //! command topics, validates every payload through [`entity::parse_set`] and
@@ -20,24 +20,42 @@
 //! [`json::volatile_free`]), so a quiet heat pump produces no traffic at all -
 //! and in full every [`REFRESH`].
 //!
-//! # Why a hand-rolled client
+//! # MQTT 5, through rust-mqtt 0.6
 //!
-//! `rust-mqtt` was the ADR's default. As of 0.6.0 its `v3` module is an empty
-//! placeholder - the crate is MQTT 5 only - and the v5 client needs `alloc`
-//! or its bump allocator plus a session state machine for the QoS 1/2 flows
-//! we do not use. The last version with a working 3.1.1 client, 0.3.0, is
-//! built on `embedded-io-async` 0.6, which does not match embassy-net 0.9's
-//! sockets (0.7). `minimq` 0.13 does match our dependency versions exactly
-//! but is also MQTT 5 only and pulls in `serde`. What is actually needed here
-//! is CONNECT/CONNACK, PUBLISH at QoS 0 with retain, SUBSCRIBE and PINGREQ:
-//! [`proto`] is that, in 300 lines of pure functions with host tests, no new
-//! dependencies and no allocator.
+//! The broker is Mosquitto (the Home Assistant add-on), which speaks MQTT 5,
+//! so 3.1.1 was a constraint nothing imposed. `rust-mqtt` 0.6 is MQTT 5 only
+//! and is built on `embedded-io-async` 0.7 and `heapless` 0.9, which is
+//! exactly what embassy-net 0.9's sockets want: it drops in without a shim
+//! and it means 500 lines of packet encoding we no longer own.
+//!
+//! Three choices are worth naming:
+//!
+//! - **`alloc`, not `bump`.** The client needs somewhere to put the
+//!   variable-length fields of a received packet. `BumpBuffer` avoids the
+//!   heap but hands back slices borrowed from one backing array, which must
+//!   be invalidated with an `unsafe fn reset()` whose soundness condition is
+//!   "no value from the last packet is still alive" - an invariant this event
+//!   loop would have to re-prove on every edit. `AllocBuffer` gives owned
+//!   `Box<[u8]>` payloads instead, so a received message borrows nothing and
+//!   the event loop can publish while holding it. `esp-alloc` is already set
+//!   up (`main.rs`, `HEAP_SIZE`) because `esp-radio` allocates, and
+//!   [`MAX_PACKET`] bounds what one packet can ask for.
+//! - **A client per connection.** `Client::connect` may only be called on a
+//!   freshly built client, or after a clean `disconnect`, or after `abort`
+//!   following an unrecoverable error. Building one per attempt makes that
+//!   trivially true and gives every reconnect a clean session state; the
+//!   client is a few hundred bytes with the queue sizes below.
+//! - **[`MAX_PACKET`] in CONNECT.** Without it the client would accept (and
+//!   try to allocate) a packet of up to 268 MB. With it, the broker must not
+//!   send anything larger, and the client refuses it if it does. The
+//!   difference from the hand-rolled client is that an oversized message is
+//!   now dropped broker-side rather than read and discarded here, so it does
+//!   not show up in the capture stream.
 //!
 //! # Where the pieces live
 //!
 //! | Module | Job |
 //! |---|---|
-//! | [`proto`] | packet encode/decode, pure |
 //! | [`entity`] | the entity table, discovery payloads, payload parsing, pure |
 //! | [`json`] | the state document, pure |
 //! | [`config`] | broker address and credentials, flash record, `mqtt` command, pure |
@@ -45,6 +63,7 @@
 
 use core::cell::Cell;
 use core::fmt::Write as _;
+use core::num::NonZero;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use embassy_executor::Spawner;
@@ -55,9 +74,19 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Instant, Timer};
-use embedded_io_async::Write as _;
 use heapless::String;
 use static_cell::StaticCell;
+
+use rust_mqtt::buffer::AllocBuffer;
+use rust_mqtt::client::event::{Event, Publish};
+use rust_mqtt::client::options::{
+    ConnectOptions, DisconnectOptions, PublicationOptions, RetainHandling, SubscriptionOptions,
+    TopicReference, WillOptions,
+};
+use rust_mqtt::client::{Client, MqttError};
+use rust_mqtt::config::KeepAlive;
+use rust_mqtt::types::{MqttBinary, MqttString, TopicFilter, TopicName};
+use rust_mqtt::Bytes;
 
 use modbus_sniffer_core::Line;
 
@@ -66,15 +95,17 @@ use crate::master::{self, CommandReport, LinkState, OpMode, Snapshot};
 pub mod config;
 pub mod entity;
 pub mod json;
-pub mod proto;
 
 pub use config::{Broker, Request, Stored};
 
 /// Keepalive promised to the broker in CONNECT.
-const KEEPALIVE_S: u16 = 60;
+const KEEPALIVE: KeepAlive = match NonZero::new(60u16) {
+    Some(seconds) => KeepAlive::Seconds(seconds),
+    None => KeepAlive::Infinite,
+};
 
 /// How often a PINGREQ goes out while the connection is otherwise idle. Well
-/// inside [`KEEPALIVE_S`], so a slow broker cannot make us look dead.
+/// inside [`KEEPALIVE`], so a slow broker cannot make us look dead.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Full state refresh, regardless of change (the ADR's "plus a full refresh
@@ -100,25 +131,37 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// to the broker and keeps handing the executor back to the bus task.
 const DISCOVERY_PACE: Duration = Duration::from_millis(10);
 
-/// Socket buffers. RX only ever carries CONNACK, SUBACK, PINGRESP and short
-/// command payloads; TX has to hold one discovery payload plus its topic.
+/// Socket buffers. Both only bound how much can be in flight at once, not
+/// how big a packet may be: the client reads and writes incrementally and
+/// handles short reads and writes itself. TX is sized to swallow the largest
+/// discovery packet ([`DISCOVERY_MAX`] plus its topic) without a round trip.
 const SOCKET_RX: usize = 512;
 const SOCKET_TX: usize = 1024;
 
-/// Packet reassembly buffer. Everything we subscribe to is a handful of
-/// bytes; anything bigger is read and thrown away by [`Incoming`] rather
-/// than breaking the connection, so this does not have to be generous.
-const INCOMING_MAX: usize = 256;
+/// Largest packet the broker may send us, announced in CONNECT.
+///
+/// Everything we subscribe to is a handful of bytes, and the CONNACK of a
+/// sane broker is well under a hundred. This is the ceiling on what one
+/// received packet can allocate, which is the reason it is set at all.
+const MAX_PACKET: NonZero<u32> = match NonZero::new(1024) {
+    Some(limit) => limit,
+    None => unreachable!(),
+};
 
 /// Buffer for the state document. The host test
 /// `json::tests::the_document_fits_the_task_buffer` holds this size.
 const STATE_MAX: usize = 1024;
 
-/// Buffer for one discovery payload, likewise bounded by a host test.
+/// Buffer for one discovery payload. The host test
+/// `entity::tests::every_discovery_payload_is_balanced_json_with_the_device_block`
+/// holds this size; the largest payload today is 491 bytes (`stop_at_target`),
+/// so there is room for a third again as much. A payload that does not fit is
+/// named in the capture stream and skipped, never published truncated.
 const DISCOVERY_MAX: usize = 640;
 
-/// Buffer for a topic.
-const TOPIC_MAX: usize = 64;
+/// Buffer for a topic. The longest today is the 61-byte discovery topic of
+/// `stop_at_target`; a topic that does not fit is named and skipped.
+const TOPIC_MAX: usize = 96;
 
 /// How much of the last command report the diagnostic sensor carries.
 const REPORT_MAX: usize = 96;
@@ -126,13 +169,119 @@ const REPORT_MAX: usize = 96;
 /// Characters of a bad payload echoed into the capture stream.
 const CLIP: usize = 24;
 
-/// Largest CONNECT we can build: 10 bytes of variable header, the client id,
-/// the will topic and payload, and the longest credentials, plus the five
-/// bytes [`proto`] reserves for the fixed header. 150 bytes today.
-const CONNECT_MAX: usize = 192;
+// --- Client queue sizes, as const generics of `Client` -----------------------
 
-/// The two subscriptions, hence the SUBSCRIBE buffer.
-const SUBSCRIBE_MAX: usize = 64;
+/// SUBSCRIBE packets in flight: the command filter and `homeassistant/status`
+/// go out back to back, without waiting for the first SUBACK.
+const SUBSCRIBE_MAXIMUM: usize = 2;
+
+/// Incoming QoS 1/2 publications. We subscribe at QoS 0, so the broker never
+/// sends one; the client requires at least 1.
+const RECEIVE_MAXIMUM: usize = 1;
+
+/// Outgoing QoS 1/2 publications. Everything here is QoS 0.
+const SEND_MAXIMUM: usize = 0;
+
+/// Subscription identifiers per received PUBLISH. We never ask for any.
+const MAX_SUBSCRIPTION_IDENTIFIERS: usize = 0;
+
+/// User properties per packet. One, not zero, so the client can spot a broker
+/// that sends properties we told it not to.
+const MAX_USER_PROPERTIES: usize = 1;
+
+/// Topic aliases the broker may use towards us. None: a received PUBLISH
+/// always carries its topic name, which is what [`on_message`] routes on.
+const MAX_INCOMING_TOPIC_ALIASES: usize = 0;
+
+/// Topic aliases we use towards the broker. None: discovery touches 36
+/// distinct topics once per connection, so an alias table buys nothing.
+const MAX_OUTGOING_TOPIC_ALIASES: usize = 0;
+
+/// The client, with every queue sized for what this firmware actually does.
+type Mqtt<'socket, 'buffer> = Client<
+    'static,
+    'buffer,
+    TcpSocket<'socket>,
+    AllocBuffer,
+    SUBSCRIBE_MAXIMUM,
+    RECEIVE_MAXIMUM,
+    SEND_MAXIMUM,
+    MAX_SUBSCRIPTION_IDENTIFIERS,
+    MAX_USER_PROPERTIES,
+    MAX_INCOMING_TOPIC_ALIASES,
+    MAX_OUTGOING_TOPIC_ALIASES,
+>;
+
+/// One received application message.
+type Message<'a> = Publish<'a, MAX_SUBSCRIPTION_IDENTIFIERS, MAX_USER_PROPERTIES>;
+
+// --- Topics known at build time ---------------------------------------------
+
+/// Whether a literal fits MQTT's string field: non-empty, inside the 16-bit
+/// length prefix, no NUL.
+const fn is_mqtt_string(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() > u16::MAX as usize {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// An MQTT string from a literal, checked while the image is built.
+///
+/// The checked constructors cannot be used here: with `alloc` on, `MqttString`
+/// owns a `Box` in one of its variants, so a `Result<MqttString, _>` is not
+/// droppable in a `const fn`.
+const fn mqtt_str(text: &str) -> MqttString<'_> {
+    assert!(is_mqtt_string(text), "not a legal MQTT string");
+    MqttString::from_str_unchecked(text)
+}
+
+/// A topic name from a literal.
+///
+/// Wildcards are rejected here; the rest of the topic-name rules are
+/// `debug_assert`ed by `TopicName::new_unchecked` and held by
+/// `entity::tests::topics_follow_the_documented_layout`.
+const fn topic(text: &str) -> TopicName<'_> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(
+            bytes[i] != b'+' && bytes[i] != b'#',
+            "a topic name cannot contain a wildcard"
+        );
+        i += 1;
+    }
+    TopicName::new_unchecked(mqtt_str(text))
+}
+
+/// Binary payload from a literal, checked while the image is built.
+const fn mqtt_bytes(text: &str) -> MqttBinary<'_> {
+    assert!(
+        text.len() <= u16::MAX as usize,
+        "payload does not fit an MQTT binary field"
+    );
+    MqttBinary::from_slice_unchecked(text.as_bytes())
+}
+
+/// The MQTT client id, which is also the device id and the topic base.
+const CLIENT_ID: MqttString<'static> = mqtt_str(entity::DEVICE_ID);
+
+/// Availability topic, published on connect and as the last will.
+const AVAILABILITY: TopicName<'static> = topic(entity::TOPIC_AVAILABILITY);
+
+/// The one retained state document.
+const STATE: TopicName<'static> = topic(entity::TOPIC_STATE);
+
+/// Last will payload.
+const OFFLINE: MqttBinary<'static> = mqtt_bytes(entity::PAYLOAD_OFFLINE);
 
 static RX: StaticCell<[u8; SOCKET_RX]> = StaticCell::new();
 static TX: StaticCell<[u8; SOCKET_TX]> = StaticCell::new();
@@ -295,6 +444,8 @@ async fn mqtt_task(stack: Stack<'static>) {
         return;
     };
 
+    // A zero-sized handle on the global allocator, reborrowed for each client.
+    let mut buffer = AllocBuffer;
     let mut session = Session::new();
     let mut backoff = BACKOFF_MIN;
 
@@ -317,16 +468,17 @@ async fn mqtt_task(stack: Stack<'static>) {
         set_connection(Connection::Connecting);
         let mut socket = TcpSocket::new(stack, &mut rx[..], &mut tx[..]);
         // The stack's own timeout matters as much as the MQTT keepalive: a
-        // broker that stops acknowledging while we are inside a `write_all`
-        // (a full TX buffer) would otherwise park this task for good, and the
-        // ping arm of the event loop never gets to run. Probing every
-        // [`PING_INTERVAL`] keeps a healthy idle connection well inside it.
+        // broker that stops acknowledging while the client is inside a write
+        // would otherwise park this task for good, and the ping arm of the
+        // event loop never gets to run. Probing every [`PING_INTERVAL`] keeps
+        // a healthy idle connection well inside it.
         socket.set_timeout(Some(SOCKET_TIMEOUT));
         socket.set_keep_alive(Some(PING_INTERVAL));
 
         // Only a reconfiguration ends a session cleanly.
-        let trouble = session_with(
-            &mut socket,
+        let trouble = connect_and_serve(
+            socket,
+            &mut buffer,
             &broker,
             &mut session,
             &mut snapshots,
@@ -334,9 +486,6 @@ async fn mqtt_task(stack: Stack<'static>) {
         )
         .await
         .err();
-        socket.abort();
-        let _ = socket.flush().await;
-        drop(socket);
 
         match trouble {
             None => {
@@ -348,8 +497,7 @@ async fn mqtt_task(stack: Stack<'static>) {
                 FAILURES.fetch_add(1, Ordering::Relaxed);
                 let [a, b, c, d] = broker.host();
                 crate::publish_note(format_args!(
-                    "mqtt {} ({a}.{b}.{c}.{d}:{}), retry in {} s",
-                    trouble.as_str(),
+                    "mqtt {trouble} ({a}.{b}.{c}.{d}:{}), retry in {} s",
                     broker.port(),
                     backoff.as_secs()
                 ));
@@ -369,11 +517,14 @@ enum Trouble {
     TcpFailed,
     /// The TCP connection or the MQTT handshake timed out.
     Timeout,
-    /// The broker refused the CONNECT (return code in the payload).
+    /// The broker refused the CONNECT or sent a DISCONNECT (reason code).
     Refused(u8),
-    /// The broker said something we cannot parse, or something too big for
-    /// the receive buffer.
+    /// The broker said something the client cannot accept.
     Protocol,
+    /// A received packet could not be allocated.
+    OutOfMemory,
+    /// The configured credentials are not a legal MQTT user name or password.
+    BadCredentials,
     /// The socket died.
     SocketClosed,
     /// The broker stopped answering PINGREQ.
@@ -385,35 +536,62 @@ impl Trouble {
         match self {
             Self::TcpFailed => "tcp connect failed",
             Self::Timeout => "handshake timed out",
-            Self::Refused(_) => "connection refused by broker",
+            Self::Refused(_) => "broker refused or closed the connection",
             Self::Protocol => "protocol error",
+            Self::OutOfMemory => "out of memory receiving a packet",
+            Self::BadCredentials => "credentials are not a legal MQTT user name or password",
             Self::SocketClosed => "connection lost",
             Self::NoPingResponse => "broker stopped answering pings",
         }
     }
 }
 
-impl From<proto::Error> for Trouble {
-    fn from(error: proto::Error) -> Self {
+impl core::fmt::Display for Trouble {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())?;
+        if let Self::Refused(code) = self {
+            write!(f, ", reason 0x{code:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> From<MqttError<'_, N>> for Trouble {
+    fn from(error: MqttError<'_, N>) -> Self {
         match error {
-            proto::Error::ConnectionRefused(code) => Self::Refused(code),
+            MqttError::Network(_) => Self::SocketClosed,
+            MqttError::Alloc => Self::OutOfMemory,
+            MqttError::Disconnect { reason, .. } => Self::Refused(reason.value()),
             _ => Self::Protocol,
         }
     }
 }
 
-impl From<embassy_net::tcp::Error> for Trouble {
-    fn from(_: embassy_net::tcp::Error) -> Self {
-        Self::SocketClosed
+/// Short tag for an [`MqttError`] the client refused to act on, for the
+/// capture stream. Only the ones this firmware can actually provoke are
+/// spelled out; the rest belong to QoS and authentication flows we do not use.
+fn reason<const N: usize>(error: &MqttError<'_, N>) -> &'static str {
+    match error {
+        MqttError::Network(_) => "network error",
+        MqttError::Server => "protocol error",
+        MqttError::Alloc => "out of memory",
+        MqttError::Disconnect { .. } => "broker disconnected",
+        MqttError::UnsupportedByServer => "broker does not support it",
+        MqttError::PacketMaximumLengthExceeded | MqttError::ServerMaximumPacketSizeExceeded => {
+            "packet too large"
+        }
+        MqttError::SessionBuffer | MqttError::AllPacketIdentifiersUsed => "client queue full",
+        _ => "refused by the client",
     }
 }
 
-/// Connect, announce, and serve until something breaks.
-///
-/// `Ok(())` means the configuration changed and the caller should start over;
-/// every other ending is a [`Trouble`].
-async fn session_with(
-    socket: &mut TcpSocket<'_>,
+/// Open the TCP connection, hand the socket to a fresh client, and serve
+/// until something breaks. Dropping the client at the end of this function
+/// drops the socket with it, which removes it from the stack - the abort the
+/// caller used to do by hand.
+async fn connect_and_serve(
+    mut socket: TcpSocket<'_>,
+    buffer: &mut AllocBuffer,
     broker: &Broker,
     session: &mut Session,
     snapshots: &mut master::SnapshotReceiver,
@@ -426,44 +604,55 @@ async fn session_with(
         Err(_) => return Err(Trouble::Timeout),
     }
 
-    let (mut reader, mut writer) = socket.split();
-    let mut rx = Incoming::new();
+    let mut client = Client::new(buffer);
+    session_with(&mut client, socket, broker, session, snapshots, outcomes).await
+}
 
+/// Connect, announce, and serve until something breaks.
+///
+/// `Ok(())` means the configuration changed and the caller should start over;
+/// every other ending is a [`Trouble`].
+async fn session_with<'socket, 'buffer>(
+    client: &mut Mqtt<'socket, 'buffer>,
+    socket: TcpSocket<'socket>,
+    broker: &Broker,
+    session: &mut Session,
+    snapshots: &mut master::SnapshotReceiver,
+    outcomes: &mut master::OutcomeReceiver,
+) -> Result<(), Trouble> {
     // CONNECT, with the availability topic as the last will so the broker
     // marks the device offline if this connection dies without a goodbye.
-    let mut packet = [0u8; CONNECT_MAX];
-    let len = proto::encode_connect(
-        &mut packet,
-        &proto::Connect {
-            client_id: entity::DEVICE_ID,
-            keepalive_s: KEEPALIVE_S,
-            user: broker.user_opt(),
-            pass: broker.pass_opt(),
-            will: Some(proto::Will {
-                topic: entity::TOPIC_AVAILABILITY,
-                payload: entity::PAYLOAD_OFFLINE,
-                retain: true,
-            }),
-        },
-    )?;
-    writer.write_all(&packet[..len]).await?;
-    writer.flush().await?;
+    // Clean start: the controller keeps no session state worth resuming, and
+    // it is what makes a reconnect idempotent.
+    let mut options = ConnectOptions::new()
+        .clean_start()
+        .keep_alive(KEEPALIVE)
+        .maximum_packet_size(MAX_PACKET)
+        .will(WillOptions::new(AVAILABILITY, OFFLINE).retain());
+    if let Some(user) = broker.user_opt() {
+        let Ok(user) = MqttString::from_str(user) else {
+            return Err(Trouble::BadCredentials);
+        };
+        options = options.user_name(user);
+    }
+    if let Some(pass) = broker.pass_opt() {
+        // Never logged, here or anywhere: `Broker`'s `Debug` prints "set".
+        let Ok(pass) = MqttBinary::from_slice(pass.as_bytes()) else {
+            return Err(Trouble::BadCredentials);
+        };
+        options = options.password(pass);
+    }
 
-    // CONNACK before anything else, as the protocol requires. The result is
-    // bound before it is matched, so the borrow of `rx` taken by the read
-    // future is over by the time the body is looked at.
-    let connack = with_timeout(CONNACK_TIMEOUT, rx.next(&mut reader)).await;
-    match connack {
-        Ok(Ok(packet)) => {
-            if proto::PacketType::from_header(packet.header) != proto::PacketType::Connack {
-                return Err(Trouble::Protocol);
-            }
-            proto::parse_connack(rx.body(packet.body))?;
-        }
-        Ok(Err(trouble)) => return Err(trouble),
+    match with_timeout(
+        CONNACK_TIMEOUT,
+        client.connect(socket, &options, Some(CLIENT_ID)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Err(error.into()),
         Err(_) => return Err(Trouble::Timeout),
     }
-    rx.consume();
 
     let [a, b, c, d] = broker.host();
     crate::publish_note(format_args!(
@@ -471,28 +660,40 @@ async fn session_with(
         broker.port(),
         entity::ENTITIES.len()
     ));
+    if !client.server_config().retain_supported {
+        // Every topic here is retained, so this broker cannot host this
+        // device. Say so once rather than once per publish.
+        crate::publish_note(format_args!(
+            "mqtt broker does not support retained messages: state and discovery will not stick"
+        ));
+    }
 
-    publish(
-        &mut writer,
-        entity::TOPIC_AVAILABILITY,
-        entity::PAYLOAD_ONLINE,
-        true,
+    publish(client, AVAILABILITY, entity::PAYLOAD_ONLINE, true).await?;
+    publish_discovery(client).await?;
+
+    // A retained command would be re-delivered on every single reconnect and
+    // re-apply itself to the heat pump long after whoever published it meant
+    // it, so the broker is told not to send the retained store for this
+    // filter at all. `retain_as_published` keeps the flag the publisher set
+    // on messages that do arrive, which is what lets [`on_message`] refuse a
+    // stray `mosquitto_pub -r` while the connection is up: without it MQTT
+    // would have the broker clear the flag on forwarded messages.
+    subscribe(
+        client,
+        entity::TOPIC_COMMAND_FILTER,
+        &SubscriptionOptions::new()
+            .retain_as_published()
+            .retain_handling(RetainHandling::NeverSend),
     )
     .await?;
-    publish_discovery(&mut writer).await?;
-
-    let mut subscribe = [0u8; SUBSCRIBE_MAX];
-    let len = proto::encode_subscribe(
-        &mut subscribe,
-        1,
-        &[entity::TOPIC_COMMAND_FILTER, entity::TOPIC_HA_STATUS],
-    )?;
-    writer.write_all(&subscribe[..len]).await?;
-    writer.flush().await?;
+    // Home Assistant's birth message, on the other hand, is worth having from
+    // the retained store: it is how a device that connects after HA learns
+    // that HA is up.
+    subscribe(client, entity::TOPIC_HA_STATUS, &SubscriptionOptions::new()).await?;
 
     // First state document of this connection, unconditionally.
     session.published.clear();
-    publish_state(&mut writer, session, snapshots.try_get().as_ref()).await?;
+    publish_state(client, session, snapshots.try_get().as_ref()).await?;
 
     let mut refresh_at = Instant::now() + REFRESH;
     let mut ping_at = Instant::now() + PING_INTERVAL;
@@ -502,8 +703,12 @@ async fn session_with(
 
     loop {
         let deadline = refresh_at.min(ping_at);
+        // `poll_header` is the one arm that touches the socket, and it is the
+        // only read in this crate's API that is cancel-safe: losing the race
+        // to a snapshot or a timer cannot lose bytes. Its body is then read
+        // to completion right away, which is what `poll_body` requires.
         let event = select4(
-            rx.next(&mut reader),
+            client.poll_header(),
             snapshots.changed(),
             outcomes.changed(),
             select(Timer::at(deadline), RECONFIGURED.wait()),
@@ -512,35 +717,34 @@ async fn session_with(
 
         match event {
             // A packet from the broker.
-            Either4::First(packet) => {
-                let Packet { header, body } = packet?;
-                match proto::PacketType::from_header(header) {
-                    proto::PacketType::Publish => {
-                        let (topic, payload) = proto::split_publish(header, rx.body(body))?;
-                        // Borrowed out of the receive buffer, so the command
-                        // is handled before the buffer is reused.
-                        let retained = header & 0x01 != 0;
-                        on_message(&mut writer, session, snapshots, topic, payload, retained)
-                            .await?;
-                    }
-                    proto::PacketType::Pingresp => awaiting_pong = false,
-                    // SUBACK and anything else needs no action; a broker that
-                    // refuses the subscription shows up as commands never
-                    // arriving, which the capture log makes visible.
-                    _ => {}
+            Either4::First(header) => match client.poll_body(header?).await? {
+                Event::Publish(message) => {
+                    // The payload is owned (`AllocBuffer`), so handling it can
+                    // publish without aliasing anything the client holds.
+                    on_message(client, session, snapshots, &message).await?;
                 }
-                rx.consume();
-            }
+                Event::Pingresp => awaiting_pong = false,
+                Event::Suback(suback) if suback.reason_code.is_erroneous() => {
+                    // Commands will simply never arrive; say which.
+                    crate::publish_note(format_args!(
+                        "mqtt broker refused a subscription, reason 0x{:02x}",
+                        suback.reason_code.value()
+                    ));
+                }
+                // Nothing else can reach us: QoS 0 both ways, no aliases, no
+                // enhanced authentication.
+                _ => {}
+            },
 
             // New heat pump state: publish only if the document changed.
             Either4::Second(snapshot) => {
-                publish_state(&mut writer, session, Some(&snapshot)).await?;
+                publish_state(client, session, Some(&snapshot)).await?;
             }
 
             // A command outcome: into the diagnostic sensor, then publish.
             Either4::Third(report) => {
                 session.set_report(&report);
-                publish_state(&mut writer, session, snapshots.try_get().as_ref()).await?;
+                publish_state(client, session, snapshots.try_get().as_ref()).await?;
             }
 
             // The refresh/keepalive timer.
@@ -549,7 +753,7 @@ async fn session_with(
                 if now >= refresh_at {
                     refresh_at = now + REFRESH;
                     session.published.clear();
-                    publish_state(&mut writer, session, snapshots.try_get().as_ref()).await?;
+                    publish_state(client, session, snapshots.try_get().as_ref()).await?;
                 }
                 if now >= ping_at {
                     if awaiting_pong {
@@ -557,24 +761,19 @@ async fn session_with(
                     }
                     ping_at = now + PING_INTERVAL;
                     awaiting_pong = true;
-                    writer.write_all(&proto::PINGREQ).await?;
-                    writer.flush().await?;
+                    client.ping().await?;
                 }
             }
             // The `mqtt` command changed the configuration.
             Either4::Fourth(Either::Second(())) => {
-                // Say goodbye properly: a retained "offline" and a DISCONNECT,
-                // so the broker does not fire the will and HA sees one clean
-                // transition.
-                let _ = publish(
-                    &mut writer,
-                    entity::TOPIC_AVAILABILITY,
-                    entity::PAYLOAD_OFFLINE,
-                    true,
-                )
-                .await;
-                let _ = writer.write_all(&proto::DISCONNECT).await;
-                let _ = writer.flush().await;
+                // Say goodbye properly: a retained "offline" and a DISCONNECT
+                // with reason Success, so the broker does not fire the will
+                // and HA sees one clean transition.
+                let _ = publish(client, AVAILABILITY, entity::PAYLOAD_OFFLINE, true).await;
+                if let Ok(mut socket) = client.disconnect(&DisconnectOptions::new()).await {
+                    socket.abort();
+                    let _ = socket.flush().await;
+                }
                 return Ok(());
             }
         }
@@ -585,27 +784,74 @@ async fn session_with(
 // Publishing
 // ---------------------------------------------------------------------------
 
-type Writer<'a> = embassy_net::tcp::TcpWriter<'a>;
-type Reader<'a> = embassy_net::tcp::TcpReader<'a>;
+/// A topic name from a runtime string, `None` if MQTT would not take it.
+fn topic_of(text: &str) -> Option<TopicName<'_>> {
+    TopicName::new(MqttString::from_str(text).ok()?)
+}
+
+/// Subscribe to one filter at QoS 0.
+///
+/// A broker that refuses the subscription outright - one without wildcard
+/// support, say - is named in the capture stream rather than dropped, because
+/// reconnecting would only ask it the same question again. The connection is
+/// still worth having: state and discovery keep going out, only commands
+/// never arrive. The SUBACK is logged by the event loop.
+async fn subscribe(
+    client: &mut Mqtt<'_, '_>,
+    topic: &str,
+    options: &SubscriptionOptions<'_>,
+) -> Result<(), Trouble> {
+    let Some(filter) = MqttString::from_str(topic).ok().and_then(TopicFilter::new) else {
+        crate::publish_note(format_args!("mqtt {topic} is not a legal topic filter"));
+        return Ok(());
+    };
+    match client.subscribe(filter, options).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_recoverable() => {
+            crate::publish_note(format_args!(
+                "mqtt subscription to {topic} not made: {}",
+                reason(&error)
+            ));
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// Publish one message at QoS 0.
 ///
-/// The payload is written straight from the caller's buffer: only the fixed
-/// header is assembled here, so a 600-byte discovery payload is never copied.
+/// A recoverable refusal by the client - a payload past the broker's packet
+/// size, a broker without retain - is named in the capture stream and
+/// swallowed: it says nothing about the health of the connection, and
+/// dropping the session over it would turn into a reconnect loop.
 async fn publish(
-    writer: &mut Writer<'_>,
-    topic: &str,
+    client: &mut Mqtt<'_, '_>,
+    name: TopicName<'_>,
     payload: &str,
     retain: bool,
 ) -> Result<(), Trouble> {
-    let mut head = [0u8; proto::MAX_PUBLISH_HEADER];
-    let len = proto::publish_header(&mut head, topic, payload.len(), retain)?;
-    writer.write_all(&head[..len]).await?;
-    writer.write_all(topic.as_bytes()).await?;
-    writer.write_all(payload.as_bytes()).await?;
-    writer.flush().await?;
-    PUBLISHED.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+    let mut options = PublicationOptions::new(TopicReference::Name(name));
+    if retain {
+        options = options.retain();
+    }
+    match client
+        .publish(&options, Bytes::from(payload.as_bytes()))
+        .await
+    {
+        Ok(_) => {
+            PUBLISHED.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(error) if error.is_recoverable() => {
+            crate::publish_note(format_args!(
+                "mqtt publish of {} bytes not sent: {}",
+                payload.len(),
+                reason(&error)
+            ));
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Publish the retained discovery config of every entity.
@@ -613,14 +859,14 @@ async fn publish(
 /// Sent on every connect and whenever Home Assistant announces itself on
 /// `homeassistant/status`, because a restarted HA with a cleared recorder
 /// otherwise has no entities until the next reboot of this device.
-async fn publish_discovery(writer: &mut Writer<'_>) -> Result<(), Trouble> {
-    let mut topic: String<TOPIC_MAX> = String::new();
+async fn publish_discovery(client: &mut Mqtt<'_, '_>) -> Result<(), Trouble> {
+    let mut name: String<TOPIC_MAX> = String::new();
     let mut payload: String<DISCOVERY_MAX> = String::new();
 
     for descriptor in entity::ENTITIES {
-        topic.clear();
+        name.clear();
         payload.clear();
-        let built = entity::write_discovery_topic(&mut topic, descriptor).is_ok()
+        let built = entity::write_discovery_topic(&mut name, descriptor).is_ok()
             && entity::write_discovery(&mut payload, descriptor, env!("CARGO_PKG_VERSION")).is_ok();
         if !built {
             // A buffer too small is our bug, not the broker's; name the entity
@@ -631,7 +877,14 @@ async fn publish_discovery(writer: &mut Writer<'_>) -> Result<(), Trouble> {
             ));
             continue;
         }
-        publish(writer, &topic, &payload, true).await?;
+        let Some(name) = topic_of(&name) else {
+            crate::publish_note(format_args!(
+                "mqtt discovery topic for {} is not a legal topic name",
+                descriptor.object_id
+            ));
+            continue;
+        };
+        publish(client, name, &payload, true).await?;
         Timer::after(DISCOVERY_PACE).await;
     }
     Ok(())
@@ -639,7 +892,7 @@ async fn publish_discovery(writer: &mut Writer<'_>) -> Result<(), Trouble> {
 
 /// Build the state document and publish it if it differs from the last one.
 async fn publish_state(
-    writer: &mut Writer<'_>,
+    client: &mut Mqtt<'_, '_>,
     session: &mut Session,
     snapshot: Option<&Snapshot>,
 ) -> Result<(), Trouble> {
@@ -656,7 +909,7 @@ async fn publish_state(
     if json::volatile_free(&next) == json::volatile_free(&session.published) {
         return Ok(());
     }
-    publish(writer, entity::TOPIC_STATE, &next, true).await?;
+    publish(client, STATE, &next, true).await?;
     session.published = next;
     Ok(())
 }
@@ -671,19 +924,25 @@ async fn publish_state(
 /// the capture stream and dropped - never forwarded, never guessed at (ADR,
 /// "invalid payloads are rejected and logged, never forwarded").
 async fn on_message(
-    writer: &mut Writer<'_>,
+    client: &mut Mqtt<'_, '_>,
     session: &mut Session,
     snapshots: &mut master::SnapshotReceiver,
-    topic: &str,
-    payload: &[u8],
-    retained: bool,
+    message: &Message<'_>,
 ) -> Result<(), Trouble> {
+    let Some(name) = message.topic.name() else {
+        // A topic alias, which we told the broker in CONNECT we do not take.
+        crate::publish_note(format_args!("mqtt message on an unexpected topic alias"));
+        return Ok(());
+    };
+    let topic = name.as_ref().as_str();
+    let payload = message.message.as_bytes();
+
     if topic == entity::TOPIC_HA_STATUS {
         if payload == entity::PAYLOAD_ONLINE.as_bytes() {
             crate::publish_note(format_args!("mqtt home assistant online: discovery again"));
-            publish_discovery(writer).await?;
+            publish_discovery(client).await?;
             session.published.clear();
-            publish_state(writer, session, snapshots.try_get().as_ref()).await?;
+            publish_state(client, session, snapshots.try_get().as_ref()).await?;
         }
         return Ok(());
     }
@@ -699,11 +958,11 @@ async fn on_message(
         return Ok(());
     };
 
-    // A retained command would be re-delivered on every single reconnect and
-    // re-apply itself to the heat pump long after whoever published it meant
-    // it. Home Assistant never publishes commands retained; anything that
-    // does is almost certainly a stray `mosquitto_pub -r`.
-    if retained {
+    // The command subscription asks the broker not to send the retained store
+    // at all, so this catches a retained message published while we are up.
+    // Home Assistant never publishes commands retained; anything that does is
+    // almost certainly a stray `mosquitto_pub -r`.
+    if message.retain {
         refuse(session, object, text, "retained command ignored");
         return Ok(());
     }
@@ -799,115 +1058,5 @@ impl Session {
                 write_failures: s.counters.write_failures,
             }),
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Incoming packet buffer
-// ---------------------------------------------------------------------------
-
-/// One packet, as offsets into [`Incoming`]'s buffer.
-struct Packet {
-    header: u8,
-    body: (usize, usize),
-}
-
-/// Reassembles packets from the TCP stream.
-///
-/// A single `read` is the only thing awaited, and it is cancel-safe: the
-/// event loop can lose the race to a snapshot or a timer without losing
-/// bytes, which a multi-read "read the whole packet" helper could not
-/// promise.
-struct Incoming {
-    buf: [u8; INCOMING_MAX],
-    len: usize,
-    /// Bytes of the packet last returned, to be dropped on [`Self::consume`].
-    done: usize,
-    /// Bytes of an oversized packet still to be read and thrown away.
-    discard: usize,
-}
-
-impl Incoming {
-    const fn new() -> Self {
-        Self {
-            buf: [0; INCOMING_MAX],
-            len: 0,
-            done: 0,
-            discard: 0,
-        }
-    }
-
-    /// The body of a packet [`Self::next`] returned.
-    fn body(&self, body: (usize, usize)) -> &[u8] {
-        &self.buf[body.0..body.1]
-    }
-
-    /// Drop the packet last returned. Must be called before the next
-    /// [`Self::next`], which is why the two are never in one expression.
-    fn consume(&mut self) {
-        self.buf.copy_within(self.done..self.len, 0);
-        self.len -= self.done;
-        self.done = 0;
-    }
-
-    /// The next whole packet, reading from the socket as needed.
-    async fn next(&mut self, reader: &mut Reader<'_>) -> Result<Packet, Trouble> {
-        loop {
-            // Throw away an oversized packet rather than giving up on the
-            // connection: the stream stays framed, so one absurd retained
-            // message cannot turn into a reconnect loop.
-            if self.discard > 0 {
-                let want = self.discard.min(self.buf.len());
-                match reader.read(&mut self.buf[..want]).await {
-                    Ok(0) | Err(_) => return Err(Trouble::SocketClosed),
-                    Ok(n) => self.discard -= n,
-                }
-                continue;
-            }
-            if let Some(packet) = self.parse()? {
-                return Ok(packet);
-            }
-            if self.len == self.buf.len() {
-                // Cannot happen: `parse` turns a packet larger than the
-                // buffer into a discard before it can fill up. Belt and
-                // braces against a silent spin.
-                return Err(Trouble::Protocol);
-            }
-            match reader.read(&mut self.buf[self.len..]).await {
-                Ok(0) => return Err(Trouble::SocketClosed),
-                Ok(n) => self.len += n,
-                Err(_) => return Err(Trouble::SocketClosed),
-            }
-        }
-    }
-
-    /// A whole packet in the buffer, if there is one.
-    fn parse(&mut self) -> Result<Option<Packet>, Trouble> {
-        let Some(&header) = self.buf[..self.len].first() else {
-            return Ok(None);
-        };
-        let Some((remaining, digits)) = proto::decode_varint(&self.buf[1..self.len])? else {
-            return Ok(None);
-        };
-        let start = 1 + digits;
-        let end = start + remaining as usize;
-        if end > self.buf.len() {
-            // Nothing we subscribe to is anywhere near this big.
-            crate::publish_note(format_args!(
-                "mqtt dropped an oversized packet ({end} bytes, buffer {INCOMING_MAX})"
-            ));
-            self.discard = end - self.len;
-            self.len = 0;
-            self.done = 0;
-            return Ok(None);
-        }
-        if self.len < end {
-            return Ok(None);
-        }
-        self.done = end;
-        Ok(Some(Packet {
-            header,
-            body: (start, end),
-        }))
     }
 }
