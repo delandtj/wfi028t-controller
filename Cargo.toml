@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["hp-model", "fw"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+# espflash extracts the image from the ELF; esp-backtrace wants DWARF in it.
+debug = 2

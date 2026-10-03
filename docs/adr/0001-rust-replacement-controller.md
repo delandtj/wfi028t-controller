@@ -1,8 +1,8 @@
 # Rust replacement controller for the WFI-028T/035T heat pump
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-10-03
-**Updated**: 2026-10-03 (moved to its own project; sniffer functions integrated here)
+**Updated**: 2026-10-03 (review asks settled: MQTT, core as path dependency, wall display dropped)
 
 ---
 
@@ -97,8 +97,9 @@ master before raising E09.
    - Scaling table per field (raw/10, raw/2, x1), bit accessors for 0x003f,
      0x0004, 0x0005.
    - Validation: `Settings::apply(Command) -> Result<Settings, Rejected>`.
-   - Depends only on `modbus-sniffer-core` (CRC/framing); fully unit-tested
-     on the host against frames captured from the real bus.
+   - No dependencies (CRC-16 is local: `modbus-sniffer-core` would pull
+     embassy-sync into a pure data model); fully unit-tested on the host
+     against frames and blocks captured from the real bus.
 
 2. **Bus master** (`fw/src/master.rs`)
    - Owns UART1 TX+RX (RX only in `listen-only` mode). A single task runs the cycle: read status, wait,
@@ -114,8 +115,10 @@ master before raising E09.
      decoded status + settings + link state).
 
 3. **MQTT + HA discovery** (`fw/src/mqtt.rs`)
-   - MQTT 3.1.1 client over embassy-net TCP (crate choice open: `rust-mqtt`
-     or `minimq`).
+   - MQTT 3.1.1 client over embassy-net TCP, hand-rolled (`fw/src/mqtt/`):
+     rust-mqtt 0.6 is MQTT 5 only, its last 3.1.1 release is on an older
+     embedded-io-async, and minimq is MQTT 5 + serde. QoS 0 publish/subscribe,
+     retain, LWT and ping are all that is needed.
    - On connect: publish retained discovery configs for every entity, the
      availability topic, then state.
    - State publishing: on change, plus a full refresh every 60 s.
@@ -285,8 +288,9 @@ this bus.
 - **Status bits** (compressor, defrost, faults): default is "raw word sensors
   plus confirmed bits only"; add entities as the multi-day capture confirms
   them.
-- **MQTT and OTA crates**: default `rust-mqtt` and the esp-bootloader OTA
-  support; pivot if either does not build against esp-hal 1.2.
+- **MQTT and OTA crates**: MQTT ended up hand-rolled (see component 3). OTA:
+  default the esp-bootloader OTA support; pivot if it does not build against
+  esp-hal 1.2. Flash is ~500 KB of .text already, so check the two-slot fit.
 
 ### The mechanical work
 - Register model module with unit tests from captured frames.
@@ -298,11 +302,13 @@ this bus.
 - OTA with rollback.
 - README/HANDOFF/register-map updates; wiring section for TX.
 
-Review asks:
-1. MQTT with HA discovery: yes or no (is a broker acceptable)?
-2. Reuse `modbus-sniffer-core` as a git dependency, or vendor it here?
-3. Wall display loss acceptable, or should the "second master in the gaps"
-   alternative be explored first?
+Review asks (settled 2026-10-03):
+1. MQTT with HA discovery: yes, a broker on the LAN is fine.
+2. `modbus-sniffer-core`: path dependency on `../stm32-modbus-sniffer/core`
+   (that repo has no remote yet); vendor only if the controller needs changes
+   in it.
+3. Wall display loss: accepted; the "second master in the gaps" alternative
+   is not pursued.
 
 ---
 
@@ -313,7 +319,7 @@ Review asks:
       Bench test.
 - [ ] How long until E09 when the master goes silent, and does E09 latch?
       Bench test.
-- [ ] MQTT broker available on the LAN? (Decides MQTT vs native API.)
+- [x] MQTT broker available on the LAN? Yes: MQTT with HA discovery.
 
 **Behavior definers**
 - [ ] What should the device do on E09 or a fault: report only, or attempt a
