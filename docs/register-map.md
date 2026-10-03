@@ -139,12 +139,12 @@ while running), and the 0x7fff "not present" slots 0x0016, 0x0017, 0x0019,
 | Entity | ESPHome type | Register | Status |
 |---|---|---|---|
 | Boost active (heat pump confirmation) | `binary_sensor` | 0x0004 bit 7 | confirmed |
-| Unit on (heat pump confirmation) | `binary_sensor` | 0x0005 bit 7 | likely (followed off/on 15:52-15:53 instantly) |
-| Water pump running | `binary_sensor` | 0x0004 bit 5 | likely (off ~80 s after power-off, on when the user saw the pump start 15:56:15) |
+| Run permitted (unit on and no blocking fault) | `binary_sensor` | 0x0005 bit 7 | likely (clears at power-off AND during the water flow fault while still on) |
+| Water pump output (heat pump's pump relay) | `binary_sensor` | 0x0004 bit 5 | likely (off after power-off and after the flow fault; on ~2 min before each compressor start) |
 | Heating active (or compressor enable) | `binary_sensor` | 0x0004 bit 0 | candidate (off at power-off, on 5 s after pump start) |
 | Compressor running | `binary_sensor` | derive from 0x001b > 0 or current 0x0020 > 0 | derived |
 | Defrosting | `binary_sensor` | status block | to map (wait for a defrost) |
-| Water flow alarm | `binary_sensor` | status block | to map |
+| Water flow alarm | `binary_sensor` | 0x0002 bit 1 | confirmed (flow test 16:57-17:01; set 2 s after flow stopped, self-clears when flow returns) |
 | Any fault | `binary_sensor` | status block | to map |
 | Active error code + description | `text_sensor` | status block | to map |
 | Modbus link status, raw status words | diagnostics | - | ESPHome built-in / raw reads |
@@ -186,6 +186,26 @@ Off/on 2026-10-03 (restart delay of a few minutes is normal for this unit):
 | 15:56:15 | water pump started (seen by user) | 0x0004 bit 5 on | EEV to 300 (start position) |
 | 15:56:20 | | 0x0004 bit 0 on | |
 | 15:57:32 | boost set by user, compressor running | 0x0004 bit 7 on | 41 Hz, fan 728, 7 A |
+
+Water flow test 2026-10-03 (user stopped the pool circulation pump, unit on,
+heating, ECO):
+
+| Time | Event | Status bits | Compressor / water |
+|---|---|---|---|
+| 16:57:13 | circulation stopped (note) | | 54 Hz |
+| 16:57:15 | flow fault | 0x0002 bit 1 on | 54 Hz |
+| 16:57:25 | | 0x0004 bit 0 off, 0x0005 bit 7 off, 0x0008 bit 0 on | 54 Hz, 10 A |
+| 16:58:10 | compressor stopped | 0x0004 bit 5 off, 0x0006 0x0014 -> 0 | 0 Hz; outlet rises to 39 C (stagnant) |
+| 17:01:37 | circulation back | 0x0002 bit 1 off | |
+| 17:01:38 | fault cleared | 0x0005 bit 7 on, 0x0006 -> 0x0014, 0x0008 bit 0 off | |
+| 17:03:37 | restart sequence (~2 min) | 0x0004 bit 5 on | EEV 300 |
+| 17:03:42 | | 0x0004 bit 0 on | then 41 Hz |
+
+The fault self-clears; no user action or power cycle needed. Candidates from
+this test: 0x0008 bit 0 = compressor stopped by protection; 0x0006 = 0x0014
+while no fault (meaning unknown). The generic factory document's bit tables
+for 0x0002 (it says bit 2 = water flow, bit 1 = missing phase) do NOT match
+this unit.
 
 ## Open questions
 
