@@ -327,7 +327,9 @@ Review asks (settled 2026-10-03):
 1. MQTT with HA discovery: yes, a broker on the LAN is fine.
 2. `modbus-sniffer-core`: path dependency on `../stm32-modbus-sniffer/core`
    (that repo has no remote yet); vendor only if the controller needs changes
-   in it.
+   in it. Since 2026-10-04 a git dependency on
+   https://github.com/delandtj/modbus-sniffer.git, pinned by Cargo.lock;
+   take a core change with `cargo update -p modbus-sniffer-core`.
 3. Wall display loss: accepted; the "second master in the gaps" alternative
    is not pursued.
 

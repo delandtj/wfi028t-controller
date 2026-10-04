@@ -27,7 +27,7 @@ esp-storage = { version = "0.10", features = ["esp32c6"] }
 heapless = "0.8.0"
 heapless09 = { version = "0.9", package = "heapless", default-features = false }
 hp-model = { version = "0.1.0", path = "../hp-model" }
-modbus-sniffer-core = { version = "0.1.0", path = "../../stm32-modbus-sniffer/core" }
+modbus-sniffer-core = { version = "0.1.0", git = "https://github.com/delandtj/modbus-sniffer.git" }
 rust-mqtt = { version = "0.6", default-features = false, features = ["v5", "alloc"] }
 sha2 = { version = "0.10", default-features = false }
 smart-leds = "0.4.0"

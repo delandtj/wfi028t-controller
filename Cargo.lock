@@ -1457,6 +1457,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "modbus-sniffer-core"
 version = "0.1.0"
+source = "git+https://github.com/delandtj/modbus-sniffer.git#8c2ee54a514fefc7975a10fbf35a0e8218ef81f1"
 dependencies = [
  "embassy-sync 0.8.0",
  "heapless 0.8.0",
