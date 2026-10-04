@@ -40,6 +40,10 @@ extractions. `communication-protocol-v1.3.2-eng` is for a different product
 (air-to-water) and does NOT match this bus; it may still describe extra areas
 of the same PCB (0x0300 user area, 0x0360 version), untested.
 
+[`docs/home-assistant-dashboard.md`](docs/home-assistant-dashboard.md) is the
+HA side: the entity ids the firmware publishes and a dashboard built from
+them, including why there is no `climate` entity.
+
 ## Relation to the sniffer project
 
 The bus was mapped with `../stm32-modbus-sniffer` (git, its own repo):

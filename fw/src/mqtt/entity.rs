@@ -13,6 +13,11 @@
 //! that document and the middle part of the command topic, which is what
 //! makes [`parse_set`] a lookup rather than a second table.
 //!
+//! That same id goes out as Home Assistant's `object_id`, so an entity lands
+//! at `<component>.wfi028t_<object_id>` instead of at a slug of its display
+//! name. Entity ids then follow the register map, and editing a `name` below
+//! no longer renames the entity a dashboard or an automation refers to.
+//!
 //! No `climate` entity. It was considered (ADR component 3) and does not map
 //! cleanly: a single MQTT climate entity has one `min_temp`/`max_temp` pair,
 //! while this machine has three setpoints with two different ranges (P01/P03
@@ -120,8 +125,9 @@ impl Kind {
 /// One Home Assistant entity.
 #[derive(Debug, Clone, Copy)]
 pub struct Entity {
-    /// HA object id, the key in the state document, and the middle segment of
-    /// the command topic.
+    /// HA object id - published as `object_id` behind a [`DEVICE_ID`] prefix,
+    /// the key in the state document, and the middle segment of the command
+    /// topic.
     pub object_id: &'static str,
     /// Human name; HA prefixes the device name.
     pub name: &'static str,
@@ -353,6 +359,14 @@ pub fn write_command_topic(out: &mut dyn core::fmt::Write, entity: &Entity) -> c
 /// optimistic, because a `state_topic` is always present - HA therefore only
 /// shows a new value once the heat pump has reported it back.
 ///
+/// `unique_id` and `object_id` are both `wfi028t_<object_id>` and do
+/// different jobs: the first is the identity HA keys its entity registry on,
+/// the second is what it builds the entity id from. Home Assistant reads
+/// `object_id` only when it first registers an entity, so republishing this
+/// payload never renames an entity that already exists - an id assigned
+/// before this field was sent has to be changed in HA, or the device removed
+/// from the MQTT integration and rediscovered.
+///
 /// # Errors
 ///
 /// Propagates the writer's error.
@@ -364,12 +378,13 @@ pub fn write_discovery(
     write!(
         out,
         "{{\"name\":\"{}\",\"unique_id\":\"{DEVICE_ID}_{}\",\
+         \"object_id\":\"{DEVICE_ID}_{}\",\
          \"state_topic\":\"{TOPIC_STATE}\",\
          \"value_template\":\"{{{{ value_json.{} }}}}\",\
          \"availability_topic\":\"{TOPIC_AVAILABILITY}\",\
          \"payload_available\":\"{PAYLOAD_ONLINE}\",\
          \"payload_not_available\":\"{PAYLOAD_OFFLINE}\"",
-        entity.name, entity.object_id, entity.object_id
+        entity.name, entity.object_id, entity.object_id, entity.object_id
     )?;
 
     if entity.kind.writable() {
@@ -591,6 +606,22 @@ mod tests {
             assert_eq!(out.bytes().filter(|&b| b == b'"').count() % 2, 0, "{out}");
             assert!(out.contains("\"identifiers\":[\"wfi028t\"]"), "{out}");
             assert!(out.contains("\"sw_version\":\"0.1.0\""), "{out}");
+            // Registry identity and entity id are separate fields with the
+            // same value: both follow the register name, never `name`.
+            assert!(
+                out.contains(&std::format!(
+                    "\"unique_id\":\"wfi028t_{}\"",
+                    entity.object_id
+                )),
+                "{out}"
+            );
+            assert!(
+                out.contains(&std::format!(
+                    "\"object_id\":\"wfi028t_{}\"",
+                    entity.object_id
+                )),
+                "{out}"
+            );
             assert!(out.contains("\"availability_topic\":\"wfi028t/availability\""));
             assert!(out.contains("\"state_topic\":\"wfi028t/state\""));
             assert!(
@@ -646,6 +677,31 @@ mod tests {
         assert!(link.contains("\"device_class\":\"connectivity\""));
         assert!(link.contains("\"entity_category\":\"diagnostic\""));
         assert!(discovery_of("requests").contains("\"state_class\":\"total_increasing\""));
+    }
+
+    #[test]
+    fn entity_ids_are_pinned_to_the_register_name() {
+        // Home Assistant derives the entity id from `object_id`, so these are
+        // the ids docs/home-assistant-dashboard.md refers to. Without the
+        // field HA would slugify the device name plus `name` instead, and
+        // every rename below would break a dashboard.
+        for (object_id, entity_id) in [
+            ("p01", "number.wfi028t_p01"),
+            ("mode", "select.wfi028t_mode"),
+            ("power", "switch.wfi028t_power"),
+            ("inlet_water", "sensor.wfi028t_inlet_water"),
+            ("link", "binary_sensor.wfi028t_link"),
+        ] {
+            let entity = find(object_id);
+            let payload = discovery_of(object_id);
+            let expected = std::format!("\"object_id\":\"wfi028t_{object_id}\"");
+            assert!(payload.contains(&expected), "{payload}");
+            // The documented id is exactly component + the published id.
+            assert_eq!(
+                std::format!("{}.wfi028t_{object_id}", entity.kind.component()),
+                entity_id
+            );
+        }
     }
 
     #[test]

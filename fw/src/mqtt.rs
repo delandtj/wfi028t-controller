@@ -154,8 +154,8 @@ const STATE_MAX: usize = 1024;
 
 /// Buffer for one discovery payload. The host test
 /// `entity::tests::every_discovery_payload_is_balanced_json_with_the_device_block`
-/// holds this size; the largest payload today is 491 bytes (`stop_at_target`),
-/// so there is room for a third again as much. A payload that does not fit is
+/// holds this size; the largest payload today is 528 bytes (`stop_at_target`),
+/// so there is room for a fifth again as much. A payload that does not fit is
 /// named in the capture stream and skipped, never published truncated.
 const DISCOVERY_MAX: usize = 640;
 
