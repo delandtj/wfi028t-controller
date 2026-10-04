@@ -1,0 +1,21 @@
+# Partition table for the WFI-028T controller (ADR 0002, component 1).
+#
+# Replaces espflash's default single-app table with two OTA app slots. Written
+# over USB once, together with fw/bootloader/esp32c6-bootloader-rollback.bin;
+# after that every update goes over the network (fw/src/ota.rs, tools/fw-ota).
+#
+# nvs stays at 0x9000 with its default size, because that first sector holds
+# the bus/mode/MQTT records (fw/src/settings.rs) and they are meant to survive
+# this layout change. The records are found through this table at runtime, not
+# at a hard-coded address.
+#
+# 4 MB per app slot against an image of ~0.8 MB: generous on purpose, because
+# growing a slot later costs another USB flash. The ~7.8 MB above 0x820000 is
+# left unallocated.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  0x400000,
+ota_1,      app,  ota_1,    0x420000, 0x400000,

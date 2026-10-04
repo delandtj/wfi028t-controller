@@ -1,7 +1,28 @@
 [target.riscv32imac-unknown-none-elf]
 # The ESP32-C6-DevKitC-1 is flashed through the port labelled "USB" (the chip's
 # own USB-Serial-JTAG), not the one labelled "UART".
-runner = "espflash flash --monitor --chip esp32c6"
+#
+# The three OTA flags (ADR 0002) make every USB flash install the whole layout:
+#
+# - --bootloader: our rollback-enabled second-stage bootloader, built by
+#   bootloader/build.sh. espflash's own bootloader has
+#   CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE off, so an image that never confirms
+#   itself would be booted forever instead of being rolled back.
+# - --partition-table: two 4 MB app slots, nvs kept at 0x9000 (partitions.csv).
+# - --target-app-partition ota_0 and --erase-parts otadata: write the app to
+#   the first slot and reset the OTA selection to it, so a USB flash can never
+#   leave stale otadata pointing at the other (now stale) slot. nvs is not
+#   touched, so the bus/mode/MQTT settings survive.
+#
+# Both paths are relative, so run cargo from this directory (fw/) - which is
+# also the only place this .cargo/config.toml applies.
+runner = [
+  "espflash", "flash", "--monitor", "--chip", "esp32c6",
+  "--bootloader", "bootloader/esp32c6-bootloader-rollback.bin",
+  "--partition-table", "partitions.csv",
+  "--target-app-partition", "ota_0",
+  "--erase-parts", "otadata",
+]
 rustflags = [
   # esp-hal's build script drops its linker scripts in OUT_DIR; linkall.x pulls
   # in memory.x, esp32c6.x and hal-defaults.x.

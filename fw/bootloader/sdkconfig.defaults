@@ -1,0 +1,32 @@
+# Second-stage bootloader configuration for the ESP32-C6 controller board
+# (ADR 0002, component 2). Everything here is either espflash's own C6
+# configuration or the one option that is the reason this binary exists.
+#
+# From espflash 4.6's resources/bootloaders/manifest.yaml - the `defaults`
+# block plus the `esp32c6` entry - so this bootloader differs from the one
+# espflash installs by exactly one option:
+#
+#   defaults: '# CONFIG_BOOTLOADER_COMPILE_TIME_DATE is not set'
+#   esp32c6:  CONFIG_ESPTOOLPY_FLASHSIZE_64MB=y
+#             CONFIG_ESPTOOLPY_FLASHSIZE="64MB"
+#
+# A compile-time date would make the build unreproducible for no gain.
+# CONFIG_BOOTLOADER_COMPILE_TIME_DATE is not set
+
+# The flash size the bootloader assumes when it maps the app. 64 MB covers the
+# 16 MB part on the DevKitC-1 and is what espflash ships for this chip.
+CONFIG_ESPTOOLPY_FLASHSIZE_64MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="64MB"
+
+# The reason for a custom bootloader: an image that boots as PendingVerify and
+# never confirms itself (crash, watchdog, probation timeout in fw/src/ota.rs)
+# is marked Aborted on the next boot and the previous slot is booted instead.
+# Without this the stock espflash bootloader keeps booting the broken image.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Deliberately NOT enabled, all of them irreversible on real silicon and none
+# of them needed for a device on a trusted LAN (ADR 0002, "Negative"):
+#   CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK  - eFuse secure version counter
+#   CONFIG_SECURE_BOOT                   - signed bootloader + app
+#   CONFIG_SECURE_FLASH_ENC_ENABLED      - flash encryption
+# Downgrades are allowed on purpose: that is how a bad release is undone.

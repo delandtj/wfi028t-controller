@@ -2,3 +2,4 @@
 /.cargo/
 __pycache__/
 *.pyc
+/fw/bootloader/build/
