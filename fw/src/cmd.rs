@@ -330,6 +330,17 @@ fn status_reply() -> Line {
         mqtt::failures(),
     );
 
+    // The two ADR 0002 fields, at the end for the same reason the mqtt ones
+    // are: a host parser reads `# ` lines as opaque text. `ota=` is the
+    // running image's OTA verdict (`pending` while it is on probation), and
+    // `console=` says whether somebody is attached to port 4001.
+    let _ = write!(
+        reply,
+        " ota={} console={}",
+        crate::ota::state_str(),
+        crate::net::console_state(),
+    );
+
     if reply.push_str("\r\n").is_err() {
         return reply_err("status line too long");
     }
@@ -470,6 +481,14 @@ async fn set_command(rest: &str) -> Line {
 
     if master::mode() != OpMode::Master {
         return reply_err("not in master mode (try: mode master)");
+    }
+
+    // An update has been accepted and the reboot is a few hundred
+    // milliseconds away: this command would be queued into a firmware that
+    // is about to stop existing. Probation itself does NOT block commands
+    // (ADR 0002, review ask 1) - only the reboot does.
+    if crate::ota::rebooting() {
+        return reply_err("rebooting into a new image; re-issue this after the reboot");
     }
 
     // Subscribe before queueing, and mark whatever is already there as seen,

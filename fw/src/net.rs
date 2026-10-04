@@ -13,10 +13,25 @@
 //!   connection then replaces the old one. That is what stops a half-dead TCP
 //!   session - the normal outcome of rebooting the logging server - from
 //!   locking everyone out until the sniffer is power-cycled.
+//! - [`console_task`] is the same line protocol on [`CONSOLE_PORT`], for
+//!   whoever wants to type at the device while the capture daemon keeps 4000.
+//! - [`crate::ota`]'s receiver listens on its own port; it is started from
+//!   here for the same reason MQTT is.
 //!
 //! The TCP cursor into the line ring lives in `tcp_task` and therefore survives
 //! client disconnects, which is what gives a reconnecting client its replay of
 //! everything produced while it was away.
+//!
+//! # Why the console is a second port instead of a second client on 4000
+//!
+//! Port 4000's cursor is the capture: every line handed to that client is a
+//! line the capture files have. It survives disconnects so a daemon restart
+//! replays what it missed. A second client on the same port would make "which
+//! connection owns the capture cursor" depend on connect order (ADR 0002,
+//! "Console as a second client on port 4000"). The console therefore has its
+//! own port, its own ring consumer (`CONSUMER_CONSOLE`) and its own cursor,
+//! which starts at the ring head: a console gets the live tail, no replay, and
+//! never moves the capture's cursor.
 
 use core::sync::atomic::Ordering;
 
@@ -40,8 +55,12 @@ use sniffer::{Chunk, Line, Marker};
 
 use crate::{CommandBuffer, DEVICE_NAME, RSSI_UNKNOWN, WIFI_IP, WIFI_RSSI, WIFI_UP};
 
-/// The line server's TCP port.
+/// The line server's TCP port. The capture daemon's.
 pub const TCP_PORT: u16 = 4000;
+
+/// The console port: the same line protocol and the same commands, with a
+/// cursor that starts at the live tail (ADR 0002, component 6).
+pub const CONSOLE_PORT: u16 = 4001;
 
 /// DHCP hostname, so the server can reach the controller by name.
 ///
@@ -50,9 +69,10 @@ pub const TCP_PORT: u16 = 4000;
 /// is how a capture ends up pointed at the wrong device.
 const HOSTNAME: &str = "wfi-controller";
 
-/// Sockets the stack has to manage: the two line-server sockets, the MQTT
-/// client's socket, and the DHCP client.
-const SOCKETS: usize = 4;
+/// Sockets the stack has to manage: the two line-server sockets, the console
+/// socket, the OTA receiver's socket, the MQTT client's socket, and the DHCP
+/// client.
+const SOCKETS: usize = 6;
 
 /// Per-socket buffers. The RX buffer only ever carries short commands; the TX
 /// buffer wants room so a replay burst is not written one segment at a time.
@@ -76,6 +96,22 @@ static RX_A: StaticCell<[u8; TCP_RX_BUF]> = StaticCell::new();
 static TX_A: StaticCell<[u8; TCP_TX_BUF]> = StaticCell::new();
 static RX_B: StaticCell<[u8; TCP_RX_BUF]> = StaticCell::new();
 static TX_B: StaticCell<[u8; TCP_TX_BUF]> = StaticCell::new();
+static RX_CONSOLE: StaticCell<[u8; TCP_RX_BUF]> = StaticCell::new();
+static TX_CONSOLE: StaticCell<[u8; TCP_TX_BUF]> = StaticCell::new();
+
+/// Whether somebody is on the console port, for the `status` line.
+static CONSOLE_CONNECTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// `"connected"` while a console client is attached, `"idle"` otherwise.
+#[must_use]
+pub fn console_state() -> &'static str {
+    if CONSOLE_CONNECTED.load(Ordering::Relaxed) {
+        "connected"
+    } else {
+        "idle"
+    }
+}
 
 /// Bring up the radio, the network stack and the line server.
 ///
@@ -127,7 +163,9 @@ pub fn start(
     spawner.spawn(wifi_task(controller).unwrap());
     spawner.spawn(link_task(stack).unwrap());
     spawner.spawn(tcp_task(stack).unwrap());
+    spawner.spawn(console_task(stack).unwrap());
     crate::mqtt::start(spawner, stack);
+    crate::ota::serve(spawner, stack);
     true
 }
 
@@ -355,4 +393,120 @@ async fn serve_client(
     // The caller inspects `idle` afterwards to see whether a new client took
     // over, so the branch that won does not matter here.
     let _ = select3(pump, commands, idle.accept(TCP_PORT)).await;
+}
+
+// ---------------------------------------------------------------------------
+// Console
+// ---------------------------------------------------------------------------
+
+/// The console server on [`CONSOLE_PORT`]: one client at a time, the live
+/// tail of the ring, and the full command set.
+///
+/// One socket, not two like [`tcp_task`]: the socket budget ADR 0002 sets
+/// ([`SOCKETS`]) gives the console one and the OTA receiver one. A console
+/// connection is therefore exclusive until it ends or the stack times it out
+/// ([`TCP_TIMEOUT`] with keep-alive probes), rather than being displaced by
+/// the next connection the way a capture client is. Nothing on this port can
+/// hold up the capture: the two have separate cursors and separate wakeups.
+#[embassy_executor::task]
+async fn console_task(stack: Stack<'static>) {
+    let mut socket = TcpSocket::new(
+        stack,
+        RX_CONSOLE.init([0; TCP_RX_BUF]),
+        TX_CONSOLE.init([0; TCP_TX_BUF]),
+    );
+    socket.set_timeout(Some(TCP_TIMEOUT));
+    socket.set_keep_alive(Some(TCP_KEEPALIVE));
+
+    loop {
+        if socket.accept(CONSOLE_PORT).await.is_err() {
+            socket.abort();
+            let _ = socket.flush().await;
+            Timer::after(Duration::from_millis(200)).await;
+            continue;
+        }
+
+        CONSOLE_CONNECTED.store(true, Ordering::Relaxed);
+        // The live tail: a console is for watching what happens next, and a
+        // 64 KB replay of what the capture already has is noise. This is also
+        // why the cursor is a local - nothing about it survives the client.
+        let mut cursor = crate::line_bus().next_seq();
+        serve_console(&mut socket, &mut cursor).await;
+        CONSOLE_CONNECTED.store(false, Ordering::Relaxed);
+
+        socket.abort();
+        let _ = socket.flush().await;
+    }
+}
+
+/// Serve one console client until it goes away.
+async fn serve_console(socket: &mut TcpSocket<'static>, cursor: &mut u64) {
+    let mut hello = Line::new();
+    let hello_ok = sniffer::format_hello(
+        DEVICE_NAME,
+        env!("CARGO_PKG_VERSION"),
+        Instant::now().as_millis(),
+        crate::current_bus(),
+        // No replay on this port, and the hello line says so.
+        0,
+        &mut hello,
+    )
+    .is_ok();
+    if hello_ok && socket.write_all(hello.as_bytes()).await.is_err() {
+        return;
+    }
+
+    let replies: Channel<NoopRawMutex, Line, 2> = Channel::new();
+    let (mut reader, mut writer) = socket.split();
+
+    let pump = async {
+        let mut buf = [0u8; sniffer::MAX_LINE_LEN];
+        let mut marker = Marker::new();
+        loop {
+            let out = select(
+                crate::line_bus().next(sniffer::CONSUMER_CONSOLE, cursor, &mut buf),
+                replies.receive(),
+            )
+            .await;
+
+            let written = match out {
+                Either::First(Chunk::Line(len)) => writer.write_all(&buf[..len]).await,
+                // A slow console loses lines, says so, and that is the end of
+                // it: these are not counted as capture gaps
+                // (`crate::dropped_lines`), because the capture on 4000 has
+                // its own cursor and did not lose them.
+                Either::First(Chunk::Dropped(missed)) => {
+                    if sniffer::format_dropped_lines(missed, &mut marker).is_ok() {
+                        writer.write_all(marker.as_bytes()).await
+                    } else {
+                        Ok(())
+                    }
+                }
+                Either::First(Chunk::Empty) => Ok(()),
+                Either::Second(reply) => writer.write_all(reply.as_bytes()).await,
+            };
+            if written.is_err() || writer.flush().await.is_err() {
+                return;
+            }
+        }
+    };
+
+    let commands = async {
+        let mut command = CommandBuffer::new();
+        let mut chunk = [0u8; 64];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    for &byte in &chunk[..n] {
+                        if let Some(reply) = command.feed(byte).await {
+                            replies.send(reply).await;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let _ = select(pump, commands).await;
 }

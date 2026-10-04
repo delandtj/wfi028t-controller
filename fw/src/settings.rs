@@ -159,6 +159,26 @@ pub async fn init(flash: esp_hal::peripherals::FLASH<'static>) -> (BusConfig, Op
     (bus, mode)
 }
 
+/// Run `f` with exclusive use of the flash peripheral.
+///
+/// The OTA receiver and the probation check ([`crate::ota`]) write app slots
+/// and `otadata`; they go through this rather than owning flash themselves,
+/// because there is one flash peripheral and the same [`STORE`] lock has to
+/// cover both. That is also what the ADR means by "a settings write in
+/// flight finishes before the reboot": an OTA sector write and a `set`'s
+/// settings write can never overlap, in either order.
+///
+/// `f` is synchronous on purpose: every flash operation blocks the CPU
+/// anyway, and holding the lock across an await would let an OTA transfer
+/// stall `bus`, `mode` or `mqtt` for the length of a whole image.
+pub async fn with_flash<R>(
+    f: impl FnOnce(&mut FlashStorage<'static>) -> R,
+) -> Result<R, &'static str> {
+    let mut guard = STORE.lock().await;
+    let store = guard.as_mut().ok_or("settings store not initialised")?;
+    Ok(f(&mut store.flash))
+}
+
 /// Persist a bus configuration. The `Err` payload is protocol-visible text.
 pub async fn store_bus(bus: BusConfig) -> Result<(), &'static str> {
     write_records(Some(bus), None, None).await

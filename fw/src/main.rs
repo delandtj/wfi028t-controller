@@ -25,7 +25,8 @@
 //! | [`poll`] | the master task: 1 s poll, whole-block writes, mode switch |
 //! | [`master`] | state, command queue and mode for everyone else |
 //! | [`cmd`] | the line interface on both transports |
-//! | [`net`] | WiFi, DHCP, TCP 4000 |
+//! | [`net`] | WiFi, DHCP, TCP 4000 and the console on 4001 |
+//! | [`ota`] | signed firmware updates on TCP 4002, probation, rollback |
 //! | [`mqtt`] | MQTT 5 client and Home Assistant discovery |
 //! | [`led`] | status LED |
 //! | [`settings`] | bus configuration, mode and MQTT broker in flash |
@@ -82,6 +83,7 @@ mod led;
 mod master;
 mod mqtt;
 mod net;
+mod ota;
 mod settings;
 
 // UART1 and the task that drives it exist only in a real build: a `selftest`
@@ -377,6 +379,13 @@ async fn main(spawner: Spawner) {
     let (bus_config, persisted_mode) = settings::init(peripherals.FLASH).await;
     set_bus(bus_config);
 
+    // What kind of boot this is: a reboot we asked for ourselves (an update
+    // moments ago, so the bus has no other master and the silence check can
+    // be skipped once), and whether the running image still has to prove
+    // itself. Both need the flash, hence after settings::init and before the
+    // bus task, which is what the answer changes.
+    let boot = ota::boot_check().await;
+
     // The status LED first, so the board shows something while the radio comes
     // up. It owns RMT TX channel 0 and GPIO8 from here on.
     led::start(&spawner, peripherals.RMT, peripherals.GPIO8);
@@ -396,7 +405,10 @@ async fn main(spawner: Spawner) {
             peripherals.GPIO5,
             timg1.wdt,
             bus_config,
-            persisted_mode,
+            poll::Startup {
+                mode: persisted_mode,
+                skip_silence_check: boot.skip_silence_check,
+            },
         );
     }
     #[cfg(feature = "selftest")]
@@ -404,6 +416,11 @@ async fn main(spawner: Spawner) {
         let _ = persisted_mode;
         spawner.spawn(selftest_task().unwrap());
     }
+
+    // The probation watchdog, if this image has not been confirmed yet. It
+    // needs the bus task to be running (that is what it watches) and nothing
+    // else, so a new image is judged on the bus even if WiFi never comes up.
+    ota::start(&spawner, boot);
 
     let (usb_rx, usb_tx) = UsbSerialJtag::new(peripherals.USB_DEVICE)
         .into_async()

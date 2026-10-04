@@ -103,6 +103,17 @@ const MAX_REPORTED_REGS: usize = 6;
 // The task
 // ---------------------------------------------------------------------------
 
+/// How the bus task should come up.
+#[derive(Debug, Clone, Copy)]
+pub struct Startup {
+    /// The mode flash remembers.
+    pub mode: OpMode,
+    /// Skip the [`SILENCE_CHECK`] once, because this boot follows a reboot
+    /// the firmware itself initiated moments ago ([`crate::ota::boot_check`])
+    /// and the only master on the bus then was us.
+    pub skip_silence_check: bool,
+}
+
 /// Start the bus task. It owns UART1 and both bus pins from here on.
 pub fn start(
     spawner: &embassy_executor::Spawner,
@@ -111,9 +122,9 @@ pub fn start(
     tx_pin: TxPin,
     wdt: Wdt<esp_hal::peripherals::TIMG1<'static>>,
     initial_bus: BusConfig,
-    persisted_mode: OpMode,
+    startup: Startup,
 ) {
-    spawner.spawn(bus_task(uart, rx_pin, tx_pin, wdt, initial_bus, persisted_mode).unwrap());
+    spawner.spawn(bus_task(uart, rx_pin, tx_pin, wdt, initial_bus, startup).unwrap());
 }
 
 #[embassy_executor::task]
@@ -123,7 +134,7 @@ async fn bus_task(
     tx_pin: TxPin,
     mut wdt: Wdt<esp_hal::peripherals::TIMG1<'static>>,
     initial_bus: BusConfig,
-    persisted_mode: OpMode,
+    startup: Startup,
 ) {
     let mut bus = BusUart::new(uart, rx_pin, tx_pin, initial_bus);
     let mut st = State::new();
@@ -138,12 +149,27 @@ async fn bus_task(
     set_mode(OpMode::Listen);
     st.publish();
 
-    if persisted_mode == OpMode::Master {
-        crate::publish_note(format_args!(
-            "boot mode master: listening {} ms for another master",
-            SILENCE_CHECK.as_millis()
-        ));
-        let _ = engage_master(&mut bus, &mut st, &mut wdt).await;
+    if startup.mode == OpMode::Master {
+        if startup.skip_silence_check {
+            // A planned reboot: we were the master on this bus a few hundred
+            // milliseconds ago, so there is nothing to listen for and three
+            // seconds of silence is exactly what the heat pump must not get
+            // (ADR 0002, component 5). Only a software reset with a valid RTC
+            // marker gets here; a power-on never does.
+            crate::publish_note(format_args!(
+                "boot mode master after a planned reboot: skipping the {} ms silence check",
+                SILENCE_CHECK.as_millis()
+            ));
+            st.reset_cycle();
+            set_mode(OpMode::Master);
+            st.publish();
+        } else {
+            crate::publish_note(format_args!(
+                "boot mode master: listening {} ms for another master",
+                SILENCE_CHECK.as_millis()
+            ));
+            let _ = engage_master(&mut bus, &mut st, &mut wdt).await;
+        }
     }
 
     loop {

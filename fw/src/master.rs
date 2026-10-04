@@ -184,6 +184,10 @@ pub enum CommandOutcome {
     ReadbackMismatch,
     /// The firmware is in listen mode and will not transmit.
     NotMaster,
+    /// An update was accepted and the firmware is rebooting into it, so this
+    /// command will never be sent. Re-issue it after the reboot; the heat
+    /// pump keeps whatever it was set to (ADR 0002).
+    Rebooting,
 }
 
 impl CommandOutcome {
@@ -197,6 +201,7 @@ impl CommandOutcome {
             Self::NoAck => "no-ack",
             Self::ReadbackMismatch => "readback-mismatch",
             Self::NotMaster => "not-master",
+            Self::Rebooting => "rebooting",
         }
     }
 }
@@ -212,8 +217,10 @@ pub struct CommandReport {
 
 /// Receivers [`SNAPSHOT`] and [`OUTCOMES`] can hand out. The MQTT task takes
 /// one of each at boot and keeps them; the line interface takes a short-lived
-/// one per `set` command (one per transport at worst); the rest is headroom.
-const SUBSCRIBERS: usize = 6;
+/// one per `set` command (one per transport at worst, and there are three of
+/// those since ADR 0002 added the console); the OTA probation task takes one
+/// for its first two minutes; the rest is headroom.
+const SUBSCRIBERS: usize = 8;
 
 /// Latest decoded state. Subscribe with `SNAPSHOT.receiver()`.
 pub static SNAPSHOT: Watch<CriticalSectionRawMutex, Snapshot, SUBSCRIBERS> = Watch::new();
@@ -276,6 +283,27 @@ pub async fn request_mode(wanted: OpMode) -> Result<OpMode, &'static str> {
 /// `false` means the queue is full and the command was dropped.
 pub fn submit(command: Command) -> bool {
     COMMANDS.try_send(command).is_ok()
+}
+
+/// Fail everything in the queue because the firmware is about to reboot into
+/// a freshly received image ([`crate::ota`]).
+///
+/// The bus task is not involved: it may be mid-slot, and in a few hundred
+/// milliseconds it will not exist. Every waiter gets a real outcome
+/// ([`CommandOutcome::Rebooting`]) instead of its six-second timeout, and the
+/// capture log says what became of each command.
+pub fn fail_queued_for_reboot() {
+    while let Ok(command) = COMMANDS.try_receive() {
+        let report = CommandReport {
+            command,
+            outcome: CommandOutcome::Rebooting,
+        };
+        let mut line = Line::new();
+        if write_report(&mut line, &report).is_ok() {
+            crate::publish_note(format_args!("command {line}"));
+        }
+        OUTCOMES.sender().send(report);
+    }
 }
 
 // ---------------------------------------------------------------------------
