@@ -456,8 +456,12 @@ With the controller in master mode and the link up:
       `last_command` reads `#<n> pNN <v> -> ok`.
 - [ ] Five quick taps on +1 send one command with the final value.
 - [ ] Setting the value the setpoint already has sends nothing.
-- [ ] `p02 30` sent twice (e.g. via Developer Tools > Actions) shows the
-      rejection both times, not "no response" the second time.
+- [ ] `p02 30` sent twice shows the rejection both times, not "no
+      response" the second time. Publish it directly
+      (`mosquitto_pub -t wfi028t/p02/set -m 30`): HA's `number.set_value`
+      checks min/max itself and raises `ServiceValidationError` before
+      anything reaches MQTT, so Developer Tools > Actions cannot provoke a
+      bus-side rejection. The card shows that HA error as the outcome.
 - [ ] Power, boost and stop-at-target toggles show pending, then the new
       state; boost shows requested vs confirmed.
 - [ ] delta-T shows and updates; `-` when either temperature is unknown.
