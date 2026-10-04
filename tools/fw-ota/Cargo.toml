@@ -1,0 +1,10 @@
+[package]
+name = "fw-ota"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ed25519-compact = "2.6.0"
+ed25519-dalek = "3.0.0"
+getrandom = "0.4.3"
+sha2 = "0.10"
