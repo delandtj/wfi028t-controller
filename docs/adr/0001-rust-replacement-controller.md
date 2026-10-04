@@ -26,6 +26,14 @@ What we know, from a sniffed capture and a controller readout (see
   0x0040; setpoints P01-P04 in 0x0041/0x0042/0x004a/0x004d (whole degrees);
   all fourteen A01-A14 sensors in 0x000f-0x0025 with mixed scaling (/10, /2,
   x1); status bits for unit on, water pump, boost.
+- Power cut (breaker test 2026-10-04): the stock controller is fed from the
+  heat pump circuit and dies with it. The heat pump keeps its settings block
+  over the cut (first readback after power-on is the full block), and the
+  stock controller re-writes the same block ~3 s after boot. Restart: run
+  permitted +30 s, water pump +2 min, compressor ~15 s later, held at 41 Hz
+  for ~3.5 min before ramping.
+- Registers 0x0043-0x0081 of the settings block are unmapped (guesses in the
+  register map); they are passed through untouched.
 - The WFI Modbus sheet says the stock controller must be unplugged when an
   external master is used.
 

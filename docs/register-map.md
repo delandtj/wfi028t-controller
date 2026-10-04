@@ -48,6 +48,14 @@ On a settings change the controller writes the WHOLE settings block
 the heat pump ~24 ms later with `01 10 003f 0043`. The changed value is
 visible in the next poll.
 
+The controller also writes the whole block, the same way, about 3 s after it
+boots (breaker test 2026-10-04, see "Observed sequences"). The heat pump does
+keep its settings over a power cut: its first settings reply after power-on
+(15:16:09.9, before that write) already held the full block, ECO bit
+included. The boot write sent identical values, so it only re-asserts the
+controller's copy. The controller has no supply of its own: it is fed from the
+heat pump circuit, so both go down and come up together.
+
 Per the WFI sheet the stock controller must be unplugged when an external
 master is used ("If adopt Modbus, the controller should be unplug to the PCB").
 
@@ -72,6 +80,25 @@ Setpoints in the settings block are whole degrees (unlike the sensors).
 
 - (P01-P05 now confirmed; 0x0042 turned out to be P02, not P01.)
 - The live sensors are mapped (see "Sensors" under the ESPHome target).
+
+Unmapped part of the settings block. Values have been constant since the start
+of the capture (see the snapshot at the end); the meanings are guesses from the
+value patterns only:
+
+| Registers | Values | Guess |
+|---|---|---|
+| 0x0043, 0x0044 | 50, 150 | limits or setpoints (50 = max water temp?) |
+| 0x0045, 0x0046, 0x0047, 0x0048, 0x004c | -1, -1, 0x7fff, -1, -1 | unused / not set |
+| 0x0049, 0x004b | 500, 10 | 500 = EEV max steps, or 50.0 of something? |
+| 0x004e-0x0051 | 0, -20, 40, -6 | -20..40 looks like an ambient range; -6 a defrost start temp? |
+| 0x0052-0x0058 | 11, 16, 6, 17, 30, 1, 88 | defrost interval / exit temp / max duration? 88 a temp limit? |
+| 0x0059-0x005c | 40, 8, 1, 23 | unknown |
+| 0x005d-0x006b | 40 44 48 54 58 64 72 80 84 90 95 100 105 110 115 | 15-step compressor frequency ladder (Hz); boost ran at 80, settled at 72 |
+| 0x006c-0x0074 | 12 13 14 / 46 52 58 64 72 85 | second frequency table (ECO, or per ambient band?), first three maybe thresholds |
+| 0x0075-0x0081 | 0,1, 12,-1, 0,8, 0,12, 0,14, 0,17, 0 | 8/12/14/17 look like clock hours: the timer schedules? |
+
+These are likely installer/factory protection parameters. Do not write changed
+values blind; map them by changing one installer-menu parameter at a time.
 
 ## Target: ESPHome replacement controller
 
@@ -170,6 +197,11 @@ WiFi icon (Tuya module, no longer relevant).
   ESPHome writes single registers (0x06, or 0x10 with count 1 under
   `use_write_multiple`). The WFI sheet lists 0x06, but test it on this board
   first. Fallback: a lambda that rewrites the whole block like the original.
+- **Boot write is optional.** The stock controller rewrites all 67 registers
+  ~3 s after power-on, but the heat pump already holds the same block at that
+  point (it keeps its settings over a power cut). A replacement does not need
+  to push anything at boot; if it does, it must send back what it read, not
+  defaults.
 - **No climate platform in `modbus_controller`:** a thermostat card needs an
   ESPHome external component or an HA-side template; plain entities work
   without it.
@@ -207,7 +239,34 @@ while no fault (meaning unknown). The generic factory document's bit tables
 for 0x0002 (it says bit 2 = water flow, bit 1 = missing phase) do NOT match
 this unit.
 
+Breaker test 2026-10-04 (heat pump breaker off ~61 s; the sniffer is on
+another circuit; unit on, heating):
+
+| Time | Event | Status bits | Compressor / other |
+|---|---|---|---|
+| 15:14:51 | user sets ECO; block written 3x | 0x003f 0x1031 -> 0x1071, 0x0004 0xa1 -> 0x21 | target 80 Hz, then -5 Hz every 5 s |
+| 15:15:07.8 | breaker off | heat pump reply cut mid-frame (BAD_CRC), then the bus is silent: controller unpowered too | target 65 Hz |
+| 15:16:09 | breaker on, controller polling again within ~1 s | all status 0, 0x0005 bit 7 off | 0 Hz, fan 0; inlet temp reads 1.3 C and climbs to the real 27 C over ~7 s (filter) |
+| 15:16:10-24 | | | EEV homing: 21 -> 546 -> 300 (start position) |
+| 15:16:09.9 | first settings reply after power-on: full block, ECO set (heat pump kept it) | 0x003f 0x1071 | |
+| 15:16:12 | controller writes the same block 3x | | |
+| 15:16:39 | run permitted (+30 s) | 0x0005 bit 7 on, 0x0006 -> 0x0014 | |
+| 15:18:39 | water pump (+2:00) | 0x0004 bit 5 on | |
+| 15:18:44 | heating active | 0x0004 bit 0 on | fan starts, target ramps 5 Hz / 5 s |
+| 15:18:56 | compressor running | | 15 Hz |
+| 15:19:25 | start hold | | target held at 41 Hz |
+| 15:19:45 | user sets boost; block written 3x | 0x0004 bit 7 on | hold continues |
+| 15:22:31 | hold ends (~3.5 min after start) | | ramps in pairs of 5 Hz steps (5 s apart), ~1 min between pairs |
+| 15:24:45 | settled | | target 72, actual 71 Hz, 10 A, fan ~840 |
+
 ## Open questions
+
+- Where does ECO settle? The ECO run before the trip was cut off at 65 Hz while
+  still dropping, and the restart in ECO never got past the 41 Hz start hold.
+  Leave ECO on ~10 min and see whether the target lands on a value from the
+  0x006c-0x0074 table.
+- The rest of the settings block (see "Candidates"): installer menu, one
+  parameter at a time.
 
 - Timers, clock, auto mode: change each on the controller with a note, then
   diff the settings block (P01-P05 are done).
