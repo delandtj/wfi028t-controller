@@ -163,7 +163,8 @@ const DISCOVERY_MAX: usize = 640;
 /// `stop_at_target`; a topic that does not fit is named and skipped.
 const TOPIC_MAX: usize = 96;
 
-/// How much of the last command report the diagnostic sensor carries.
+/// How much of the last command report the diagnostic sensor carries,
+/// sequence number included.
 const REPORT_MAX: usize = 96;
 
 /// Characters of a bad payload echoed into the capture stream.
@@ -954,8 +955,15 @@ async fn on_message(
     RECEIVED.fetch_add(1, Ordering::Relaxed);
 
     let Ok(text) = core::str::from_utf8(payload) else {
-        refuse(session, object, "<not utf-8>", "payload is not UTF-8");
-        return Ok(());
+        return refuse(
+            client,
+            session,
+            snapshots,
+            object,
+            "<not utf-8>",
+            "payload is not UTF-8",
+        )
+        .await;
     };
 
     // The command subscription asks the broker not to send the retained store
@@ -963,14 +971,20 @@ async fn on_message(
     // Home Assistant never publishes commands retained; anything that does is
     // almost certainly a stray `mosquitto_pub -r`.
     if message.retain {
-        refuse(session, object, text, "retained command ignored");
-        return Ok(());
+        return refuse(
+            client,
+            session,
+            snapshots,
+            object,
+            text,
+            "retained command ignored",
+        )
+        .await;
     }
     let command = match entity::parse_set(object, text) {
         Ok(command) => command,
         Err(reason) => {
-            refuse(session, object, text, reason);
-            return Ok(());
+            return refuse(client, session, snapshots, object, text, reason).await;
         }
     };
 
@@ -978,12 +992,26 @@ async fn on_message(
     // rather than queued, so it cannot fire the moment somebody switches the
     // controller to master.
     if master::mode() != OpMode::Master {
-        refuse(session, object, text, "controller is in listen mode");
-        return Ok(());
+        return refuse(
+            client,
+            session,
+            snapshots,
+            object,
+            text,
+            "controller is in listen mode",
+        )
+        .await;
     }
     if !master::submit(command) {
-        refuse(session, object, text, "command queue full");
-        return Ok(());
+        return refuse(
+            client,
+            session,
+            snapshots,
+            object,
+            text,
+            "command queue full",
+        )
+        .await;
     }
 
     let mut line = Line::new();
@@ -996,15 +1024,35 @@ async fn on_message(
     Ok(())
 }
 
-/// Log a refused command and record it in the diagnostic sensor.
-fn refuse(session: &mut Session, object: &str, payload: &str, reason: &str) {
+/// Log a refused command, record it in the diagnostic sensor and publish it
+/// now, as a bus outcome is: whoever sent the command is waiting for an
+/// answer, and the next snapshot or refresh may be a minute away.
+async fn refuse(
+    client: &mut Mqtt<'_, '_>,
+    session: &mut Session,
+    snapshots: &mut master::SnapshotReceiver,
+    object: &str,
+    payload: &str,
+    reason: &str,
+) -> Result<(), Trouble> {
     DROPPED.fetch_add(1, Ordering::Relaxed);
     let clipped = clip(payload, CLIP);
     crate::publish_note(format_args!(
         "mqtt command {object}={clipped} refused: {reason}"
     ));
-    session.last_command.clear();
-    let _ = write!(session.last_command, "{object} {clipped} -> {reason}");
+    let mut line = Line::new();
+    let _ = write!(line, "{object} {clipped} -> {reason}");
+    session.record(&line);
+    publish_state(client, session, snapshots.try_get().as_ref()).await
+}
+
+/// At most `max` bytes, cut on a character boundary.
+fn clip_bytes(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// At most `max` characters, cut on a character boundary.
@@ -1020,10 +1068,12 @@ fn clip(text: &str, max: usize) -> &str {
 // ---------------------------------------------------------------------------
 
 /// What survives one iteration of the event loop: the document last published
-/// (so a change can be detected) and the last command report.
+/// (so a change can be detected) and the last command report with its number.
 struct Session {
     published: String<STATE_MAX>,
     last_command: String<REPORT_MAX>,
+    /// Number of the last report, from 1; survives reconnects, not reboots.
+    seq: u32,
 }
 
 impl Session {
@@ -1031,16 +1081,27 @@ impl Session {
         Self {
             published: String::new(),
             last_command: String::new(),
+            seq: 0,
         }
     }
 
     /// Record a command report, in the same wording the line interface uses.
     fn set_report(&mut self, report: &CommandReport) {
         let mut line = Line::new();
-        self.last_command.clear();
         if master::write_report(&mut line, report).is_ok() {
-            let _ = self.last_command.push_str(clip(&line, REPORT_MAX));
+            self.record(&line);
         }
+    }
+
+    /// Put `text` in the diagnostic sensor as `#<n> <text>`. The number makes
+    /// every report change the state document, so a client can tell a second
+    /// identical outcome (the same command refused twice) from no answer.
+    fn record(&mut self, text: &str) {
+        self.seq = self.seq.wrapping_add(1);
+        self.last_command.clear();
+        let _ = write!(self.last_command, "#{} ", self.seq);
+        let room = REPORT_MAX - self.last_command.len();
+        let _ = self.last_command.push_str(clip_bytes(text, room));
     }
 
     /// The pure view [`json::write_state`] builds the document from.
