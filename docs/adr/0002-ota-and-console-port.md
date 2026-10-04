@@ -131,10 +131,8 @@ installs the console port; after that every update goes over the network.
      0..64" while the field widths sum to 76; 76 + 64 is 140, so the three
      numbers could not all hold. The build kept every field at its stated
      width, offset and order, put the signature last and signed everything
-     before it. The alternative (128 bytes, `target` cut to 12 and
-     `fw_version` to 8) is one edit in `fw/src/ota/header.rs` and nowhere
-     else, and would have to be made before the first image is pushed to a
-     device that is not on the bench.
+     before it. Settled 2026-10-04: 140 bytes is the v1
+     format; any change from here on needs a new `version` value.
    - Device answers single lines, the same `ok ...` / `err ...` style as the
      line interface: `ok header`, progress every 64 KB, `ok image`,
      `ok rebooting`, or one `err <reason>` and close.
@@ -355,7 +353,7 @@ not, and is not done. To be confirmed on the bench (bad_crc / timeouts stay
   - Cost to change later: host tool and firmware together; trivial before
     the first OTA image exists, annoying after (old images speak the old
     port).
-- **Header format (128 bytes, signature over the header only).**
+- **Header format (140 bytes, signature over the header only).**
   - Alternative: sign the whole image streamed (ed25519ph).
   - Cost to change later: every deployed image must understand the next
     one's header, so the version byte has to be honoured from v1 on. Most
@@ -416,8 +414,7 @@ reverse, and none of them is on the heat pump side of the device.
 1. **Header 140 bytes, signed region 0..76** instead of "128 bytes, bytes
    0..64". The ADR's own numbers were inconsistent (the fields sum to 76);
    every field kept its stated width and the signature covers all of them.
-   The one thing here that is expensive to change after the first real push -
-   flagged for review, `fw/src/ota/header.rs`.
+   Reviewed and kept on 2026-10-04 (`fw/src/ota/header.rs`).
 2. **The console port is one socket**, so a console connection is not
    displaced by the next one (component 6 above).
 3. **`fw-ota push --wait` reads the console port**, not the capture daemon's
