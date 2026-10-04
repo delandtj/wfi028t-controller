@@ -1,8 +1,11 @@
 # OTA firmware updates and a second TCP client slot
 
-**Status**: Accepted
+**Status**: Accepted, implemented
 **Date**: 2026-10-04
 **Updated**: 2026-10-04 (review asks settled: commands pass during probation, header format as specified, separate ports 4001/4002, key at ~/.config/wfi028t/)
+**Implemented**: 2026-10-04; the text below is the built thing. Where the
+build had to depart from the plan it says so, and
+["What was built differently"](#what-was-built-differently) collects it.
 
 ---
 
@@ -111,17 +114,27 @@ installs the console port; after that every update goes over the network.
    - Wire format, little endian:
 
      ```
-     header (128 bytes):
-       magic       "WOTA"            4
-       version     u8 = 1            1
-       reserved    0                 3
-       image_len   u32               4
-       image_sha   SHA-256(image)    32
-       target      "wfi028t-c6\0..." 16   refuse if not ours
-       fw_version  "0.2.0\0..."      16   informational, logged
-       signature   ed25519           64   over bytes 0..64 of this header
+     header (140 bytes):
+       offset size
+            0    4  magic       "WOTA"
+            4    1  version     u8 = 1
+            5    3  reserved    0
+            8    4  image_len   u32
+           12   32  image_sha   SHA-256(image)
+           44   16  target      "wfi028t-c6\0..."  refuse if not ours
+           60   16  fw_version  "0.2.0\0..."       informational, logged
+           76   64  signature   ed25519 over bytes 0..76 of this header
      image: image_len bytes (espflash save-image output)
      ```
+
+     As first written this block said "128 bytes" and "signature over bytes
+     0..64" while the field widths sum to 76; 76 + 64 is 140, so the three
+     numbers could not all hold. The build kept every field at its stated
+     width, offset and order, put the signature last and signed everything
+     before it. The alternative (128 bytes, `target` cut to 12 and
+     `fw_version` to 8) is one edit in `fw/src/ota/header.rs` and nowhere
+     else, and would have to be made before the first image is pushed to a
+     device that is not on the bench.
    - Device answers single lines, the same `ok ...` / `err ...` style as the
      line interface: `ok header`, progress every 64 KB, `ok image`,
      `ok rebooting`, or one `err <reason>` and close.
@@ -138,7 +151,10 @@ installs the console port; after that every update goes over the network.
 
 4. **Self-confirmation** (in `fw/src/ota.rs`, called from `main.rs`)
    - At boot: if the running slot's state is `New`/`PendingVerify`, the image
-     is on probation. `status` shows `ota=pending`, MQTT state carries it.
+     is on probation. `status` shows `ota=pending`. (The MQTT state document
+     does NOT carry it yet: that is one key in `mqtt/json.rs` plus one
+     diagnostic entity in `mqtt/entity.rs`, left for when the HA side wants
+     it. `status` and the capture log have it.)
    - Confirmed (`set_current_ota_state(Valid)`) once, within 120 s of boot:
      the bus task is alive (watchdog fed), and
      - mode master: link up and 10 consecutive clean polls;
@@ -166,7 +182,12 @@ installs the console port; after that every update goes over the network.
    - Core: `RING_CONSUMERS = 3`, new `CONSUMER_CONSOLE = 2`. The sniffer
      firmware ignores the third signal. Change lands in the sniffer repo
      (path dependency, ADR 0001).
-   - One socket on TCP 4001. Newest connection wins, as on 4000.
+   - One socket on TCP 4001. Unlike 4000 (which keeps a spare socket so the
+     newest connection can displace the old one), the console's single socket
+     means a console connection is exclusive until it ends or the stack's
+     30 s timeout with keep-alive probes reaps it: `SOCKETS = 6` leaves room
+     for one console socket and one OTA socket, not two of each. A console
+     client that hangs costs nothing but the console.
    - On connect: hello line (same format, `replay=0`), cursor set to the
      ring head; lines from then on, `[DROPPED n lines]` markers if the
      client is slow. Commands are the full line interface (`cmd.rs`), replies
@@ -182,9 +203,12 @@ installs the console port; after that every update goes over the network.
      `fw/ota-signing.pub`.
    - `fw-ota push <host> [--elf path]`: `espflash save-image --chip esp32c6`
      -> header with SHA-256 and signature -> TCP 4002 -> prints the device's
-     lines; exit status 0 only on `ok rebooting`. Optionally `--wait`: poll
-     `sniffer-capture status --control ...` until `ota=valid` or the
-     rollback shows up.
+     lines; exit status 0 only on `ok rebooting`. Optionally `--wait`: ask
+     the console port (4001) for `status` every 5 s until `ota=valid` or a
+     rollback shows up. (Planned as a poll of `sniffer-capture status
+     --control ...`; the console port does the same job without the capture
+     daemon having to be running, and it is the port this change adds
+     anyway.)
    - The public key reaches the firmware at build time:
      `include_bytes!` of `fw/ota-signing.pub` (committed; a public key).
 
@@ -356,10 +380,14 @@ not, and is not done. To be confirmed on the bench (bad_crc / timeouts stay
 
 - `fw/partitions.csv`, `fw/bootloader/` (config, script, binary), runner
   flags in `fw/.cargo/config.toml`.
-- `fw/src/ota.rs`: receiver, probation, planned-reboot marker; host tests for
-  header parsing and signature checks in a pure module (as `mqtt/entity.rs`).
-- Crates: `ed25519-compact` or `salty` (no_std verify), `sha2` (or the C6 SHA
-  peripheral); host tool: `ed25519-dalek`, `sha2`. Added with `cargo add`.
+- `fw/src/ota.rs`: receiver, probation, planned-reboot marker;
+  `fw/src/ota/header.rs` is the pure module, and `tools/fw-ota` includes that
+  same file by path - so its tests are a committed `cargo test -p fw-ota`
+  rather than the throwaway harness `mqtt/entity.rs` needs.
+- Crates: `ed25519-compact` (no_std verify, both ends) and `sha2`, both
+  `default-features = false` in the firmware; host tool: `ed25519-dalek`
+  (keygen and signing), `sha2`, `getrandom`. One host test signs with dalek
+  and verifies with compact, so the two implementations cannot drift.
 - `net.rs`: console socket and task, `SOCKETS = 6`; `cmd.rs` replies routed
   per client; `status` gains `ota=` and `console=`.
 - Sniffer core: `RING_CONSUMERS = 3`, `CONSUMER_CONSOLE`; sniffer firmware
@@ -377,6 +405,41 @@ Review asks (settled 2026-10-04):
 3. Separate ports 4001 (console) and 4002 (OTA): yes.
 4. Private key at `~/.config/wfi028t/ota-signing.key`, outside the repo: yes;
    the README says where it lives and what to do if it is lost.
+
+---
+
+## What was built differently
+
+Written after the implementation (2026-10-04). Each of these is one file to
+reverse, and none of them is on the heat pump side of the device.
+
+1. **Header 140 bytes, signed region 0..76** instead of "128 bytes, bytes
+   0..64". The ADR's own numbers were inconsistent (the fields sum to 76);
+   every field kept its stated width and the signature covers all of them.
+   The one thing here that is expensive to change after the first real push -
+   flagged for review, `fw/src/ota/header.rs`.
+2. **The console port is one socket**, so a console connection is not
+   displaced by the next one (component 6 above).
+3. **`fw-ota push --wait` reads the console port**, not the capture daemon's
+   control socket (component 7 above).
+4. **The MQTT state document does not carry `ota=`** yet (component 4 above).
+5. **The probation reset also leaves the RTC marker** (reason `probation`,
+   not just `ota`): it is the same argument - a software reset seconds after
+   we were the master - and the rolled-back image deserves the short gap just
+   as much. The marker is ignored by any image that does not know it.
+6. **`SUBSCRIBERS` in `master.rs` went 6 -> 8**: MQTT holds two, a `set`
+   command holds one per transport and there are three transports now, and
+   the probation task holds one for its first two minutes.
+7. **Flash is reached through `settings::with_flash`** rather than the OTA
+   code owning the peripheral: one lock covers the settings records and the
+   app slots, which is what makes "a settings write in flight finishes before
+   the reboot" true by construction. `esp-storage`'s write is
+   read-modify-erase-write per sector, so one `write` per 4 KB sector both
+   erases and programs - there is no separate erase pass.
+
+Still untested on hardware (the orchestrator's bench run): the USB flash of
+the new layout, settings surviving it, a real push, the rollback of an image
+that never confirms, and the size of the bus gap across a planned reboot.
 
 ---
 

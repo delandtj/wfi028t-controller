@@ -5,7 +5,9 @@ full-inverter pool heat pump (380-415V/3N), a Tuya rebrand sold as W'Eau whose
 app integration kept breaking. The device becomes the Modbus RTU master on the
 heat pump's RS-485 bus and exposes it to Home Assistant.
 
-**Status: design.** Nothing is built yet. Start with the ADR and the bench test.
+**Status: in service since 2026-10-04.** The firmware runs the heat pump as
+bus master; updates go over the network (see "Firmware updates" below). Start
+with the ADRs.
 
 ## Start here
 
@@ -13,6 +15,9 @@ heat pump's RS-485 bus and exposes it to Home Assistant.
    - the design (Proposed): Rust on an ESP32-C6, behaves exactly like the
    stock controller on the bus, MQTT with HA discovery, capture stream kept.
    Its review asks and open questions come first.
+   [`docs/adr/0002-ota-and-console-port.md`](docs/adr/0002-ota-and-console-port.md)
+   adds signed updates over the network, a rollback bootloader and a second
+   TCP client slot.
 2. [`docs/register-map.md`](docs/register-map.md) - everything known about the
    bus: framing, the controller's poll/write behaviour, confirmed registers,
    the A01-A14 sensors (mixed scaling!), P01-P05, status bits, and the target
@@ -78,6 +83,104 @@ Same as the sniffer, plus TX:
   inverted bits show up as `7f`/`fe`/`ff` garbage.
 - The stock controller is unplugged when this device is the master; keep it
   as a fallback, never both on the bus.
+
+## Network ports
+
+| Port | Who | What |
+|---|---|---|
+| 4000 | the capture daemon (`wfi-controller-capture.service`) | line stream with replay; its cursor is the capture, so nothing else should hold this |
+| 4001 | you | console: same lines and the same commands, live tail, no replay |
+| 4002 | `fw-ota` | signed firmware push, binary |
+
+Neither 4000 nor 4001 is authenticated: the LAN is trusted for commands. 4002
+accepts nothing that is not signed with the OTA key.
+
+```sh
+printf 'status\n' | nc wfi-controller 4001    # one command and the answer
+nc wfi-controller 4001                        # watch the bus, type commands
+```
+
+## Firmware updates
+
+### Once, over USB (this installs the layout)
+
+```sh
+cd fw
+cargo run --release          # the runner does all of it (see .cargo/config.toml)
+```
+
+That writes the rollback bootloader
+([`fw/bootloader/`](fw/bootloader)), the two-slot partition table
+([`fw/partitions.csv`](fw/partitions.csv)), the app into `ota_0`, and erases
+`otadata` so no stale slot selection survives. `nvs` is not touched, so the
+bus, mode and MQTT settings survive - if they do not come back, set them again
+(`mode master`, `mqtt host <ip>`, `bus 9600 8N1`).
+
+Rebuild the bootloader only if its config changes:
+`fw/bootloader/build.sh` (podman, `espressif/idf:release-v6.1`).
+
+### After that, over the network
+
+```sh
+cd fw && cargo build --release
+cargo run -p fw-ota -- push wfi-controller --wait
+```
+
+`push` builds the image with `espflash save-image`, signs a header for it,
+sends it to port 4002 and prints what the device says. It exits 0 only on
+`ok rebooting`. `--wait` then polls the console port until the new image
+confirms itself.
+
+What the device does with it (ADR 0002): checks the signature before erasing
+anything, writes the standby slot, verifies the SHA-256, points `otadata` at
+it and reboots. The new image runs **on probation** and marks itself good only
+after the bus works (`ota=valid` in `status`). If it crashes, wedges or cannot
+do the job within 120 s, the bootloader boots the previous image again
+(`ota=aborted`). Nothing about this touches the heat pump's settings, and the
+bus keeps being polled throughout; the reboot itself is a gap of under a
+second, because a planned reboot skips the 3 s silence check.
+
+### The signing key
+
+- Private key: `~/.config/wfi028t/ota-signing.key`, mode 0600, **never in the
+  repo**. Created once with `cargo run -p fw-ota -- keygen`. Back it up
+  (a password manager, or any encrypted backup - it is 64 hex characters).
+- Public key: [`fw/ota-signing.pub`](fw/ota-signing.pub), committed, compiled
+  into the firmware with `include_bytes!`. That is why it is in git: it is
+  public by definition, and the firmware has to carry it.
+- **If the private key is lost**: no network update is possible any more; the
+  running firmware accepts nothing else. Run `keygen` again (move the old
+  `fw/ota-signing.pub` aside first, `keygen` refuses to overwrite), then
+  USB-flash once so the device carries the new public key. Nothing else is
+  lost - the heat pump and the settings are untouched.
+- **If the private key leaks**: anyone on the LAN can push firmware. Same fix:
+  new key pair, one USB flash.
+
+## The `status` line
+
+One line, `# status ...`, from both the console and the capture stream. The
+first fields are the sniffer's (`modbus-sniffer-core`), the rest this
+firmware's; new fields are only ever appended, because host-side parsers read
+`# ` lines as opaque text.
+
+| Field | Meaning |
+|---|---|
+| `uptime_ms` | since boot |
+| `bus=<baud> <fmt>` | UART configuration in force |
+| `wifi=`, `ip=`, `rssi=` | link state (`?` when unknown) |
+| `frames=`, `bad_crc=`, `uart_errors=` | received frames and errors |
+| `dropped=`, `usb_dropped=` | lines the TCP / USB consumer lost |
+| `mode=` | `listen` or `master` |
+| `link=` | is the heat pump answering |
+| `requests=`, `status_ok=`, `settings_ok=`, `timeouts=`, `bad_responses=`, `echoes=`, `foreign=` | bus counters |
+| `writes=`, `write_failures=`, `settings_age_ms=` | write path |
+| `hp_power=`, `hp_boost=`, `hp_mode=`, `hp_setpoint=` | decoded settings |
+| `hp_inlet_dc=`, `hp_outlet_dc=`, `hp_hz=`, `hp_fault=` | decoded status (tenths of a degree) |
+| `status_age_ms=`, `snapshot_age_ms=` | how fresh the decoded blocks are |
+| `mqtt=`, `mqtt_host=`, `mqtt_user=` | broker state and configuration (never the password) |
+| `mqtt_published=`, `mqtt_received=`, `mqtt_dropped=`, `mqtt_failures=` | MQTT counters |
+| `ota=` | `pending` (on probation), `valid` (confirmed), `aborted`/`invalid` (came back from a rollback), `undefined` (booted after a USB flash), `unknown` (no OTA data) |
+| `console=` | `connected` or `idle` on port 4001 |
 
 ## Next steps
 
