@@ -174,6 +174,13 @@ installs the console port; after that every update goes over the network.
      Any other reset (power-on, brown-out, watchdog, panic) keeps the full
      3 s check. Marker cleared on read.
    - Target gap on the bus for an OTA reboot: under 1 s.
+   - Measured on the bench (mock, 2026-10-04): the first radio start holds
+     the executor for about 0.8 s. Started before the bus task, it made the
+     reboot gap 1.0-1.75 s of silence. Now `main` waits for the bus task's
+     first exchange (`poll::EXCHANGED`, at most 1 s) before starting WiFi:
+     the reboot itself leaves under 0.4 s of silence and the radio start one
+     separate 0.82 s hole. Keeping the PHY calibration across the reboot
+     (partial calibration) was tried and made no difference.
 
 6. **Console port** ([`fw/src/net.rs`](../../fw/src/net.rs),
    `../stm32-modbus-sniffer/core`)

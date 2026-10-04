@@ -56,6 +56,8 @@
 
 use core::fmt::Write as _;
 
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant};
 use esp_hal::timer::timg::{MwdtStage, Wdt};
 
@@ -126,6 +128,15 @@ pub fn start(
 ) {
     spawner.spawn(bus_task(uart, rx_pin, tx_pin, wdt, initial_bus, startup).unwrap());
 }
+
+/// Raised after every completed exchange in master mode (request, reply,
+/// any write), at the start of the slot's idle part.
+///
+/// `main` waits for the first one after a planned reboot before it starts the
+/// radio. The first radio start holds the executor for about 0.8 s; started
+/// here it delays one request by that much, where started before the bus task
+/// it added the same 0.8 s to the reboot gap (ADR 0002, component 5).
+pub static EXCHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 #[embassy_executor::task]
 async fn bus_task(
@@ -380,6 +391,7 @@ async fn slot(bus: &mut BusUart, st: &mut State) {
     }
 
     st.publish();
+    EXCHANGED.signal(());
 
     // 3. Listen out the rest of the slot, so a second master is noticed even
     // between our own requests.

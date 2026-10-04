@@ -428,6 +428,16 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb_tx_task(usb_tx).unwrap());
     spawner.spawn(usb_rx_task(usb_rx).unwrap());
 
+    // After a planned reboot in master mode, the bus goes first: the first
+    // radio start below holds this executor for about 0.8 s, and the heat pump
+    // has already been without a poll for the reboot. Waiting for one exchange
+    // turns one long gap into two short ones, each under a second. Any other
+    // boot spends its first 3 s in the silence check, which does not transmit.
+    #[cfg(not(feature = "selftest"))]
+    if boot.skip_silence_check && persisted_mode == master::OpMode::Master {
+        let _ = select(poll::EXCHANGED.wait(), Timer::after(Duration::from_secs(1))).await;
+    }
+
     let wifi_available = match WIFI_SSID {
         Some(ssid) => net::start(&spawner, peripherals.WIFI, ssid, WIFI_PASS.unwrap_or("")),
         None => {
