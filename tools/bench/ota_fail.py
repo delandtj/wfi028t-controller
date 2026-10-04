@@ -80,10 +80,13 @@ def console(host: str, cmd: str = "status", wait: float = 1.5) -> str:
     s = socket.create_connection((host, CONSOLE_PORT), timeout=5)
     s.sendall(cmd.encode() + b"\n")
     time.sleep(wait)
+    # The console streams bus lines without end in master mode: read for a
+    # fixed time, not until it goes quiet.
     s.settimeout(0.5)
     out = b""
+    end = time.time() + 1.0
     try:
-        while chunk := s.recv(65536):
+        while time.time() < end and (chunk := s.recv(65536)):
             out += chunk
     except socket.timeout:
         pass
