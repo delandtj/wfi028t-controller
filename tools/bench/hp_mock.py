@@ -27,7 +27,9 @@ import serial
 
 from ctl_bench import SETTINGS, SLAVE, STATUS, crc16, frame, ts
 
-FRAME_GAP = 0.004           # s; t3.5 at 9600 baud
+# s; t3.5 at 9600 baud is 4 ms, but the FTDI hands bytes over in chunks every
+# latency_timer ms (16 by default), which splits frames at 4 ms. Stay above it.
+FRAME_GAP = 0.030
 RESPONSE_DELAY = 0.150      # s; what the real heat pump takes to answer
 
 # Snapshots from docs/register-map.md, 2026-10-03 15:32 (also the hp-model
