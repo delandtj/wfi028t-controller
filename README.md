@@ -112,7 +112,9 @@ cargo run --release          # the runner does all of it (see .cargo/config.toml
 That writes the rollback bootloader
 ([`fw/bootloader/`](fw/bootloader)), the two-slot partition table
 ([`fw/partitions.csv`](fw/partitions.csv)), the app into `ota_0`, and erases
-`otadata` so no stale slot selection survives. `nvs` is not touched, so the
+`otadata` so no stale slot selection survives. On the first boot the bootloader
+writes a fresh `otadata` entry for `ota_0`, so `status` shows `ota=valid`
+straight away. `nvs` is not touched, so the
 bus, mode and MQTT settings survive - if they do not come back, set them again
 (`mode master`, `mqtt host <ip>`, `bus 9600 8N1`).
 
@@ -179,7 +181,7 @@ firmware's; new fields are only ever appended, because host-side parsers read
 | `status_age_ms=`, `snapshot_age_ms=` | how fresh the decoded blocks are |
 | `mqtt=`, `mqtt_host=`, `mqtt_user=` | broker state and configuration (never the password) |
 | `mqtt_published=`, `mqtt_received=`, `mqtt_dropped=`, `mqtt_failures=` | MQTT counters |
-| `ota=` | `pending` (on probation), `valid` (confirmed), `aborted`/`invalid` (came back from a rollback), `undefined` (booted after a USB flash), `unknown` (no OTA data) |
+| `ota=` | `pending` (on probation), `valid` (confirmed; also right after a USB flash, because the bootloader fills the erased `otadata` in for `ota_0` on first boot), `aborted`/`invalid` (came back from a rollback), `undefined` (no verdict recorded for this slot), `unknown` (no OTA data) |
 | `console=` | `connected` or `idle` on port 4001 |
 
 ## Next steps

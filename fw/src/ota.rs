@@ -133,10 +133,11 @@ static REBOOTING: AtomicBool = AtomicBool::new(false);
 /// The OTA state of the running image, for the `status` line.
 ///
 /// - `pending`: on probation, has not confirmed itself yet
-/// - `valid`: confirmed; the bootloader will keep booting it
+/// - `valid`: confirmed; the bootloader will keep booting it. Also the state
+///   after a USB flash: the bootloader fills the erased `otadata` in for
+///   `ota_0` on first boot
 /// - `aborted` / `invalid`: this image came back from a rolled-back attempt
-/// - `undefined`: booted without an OTA verdict, which is what a USB flash
-///   (`otadata` erased) leaves behind
+/// - `undefined`: booted without an OTA verdict for this slot
 /// - `unknown`: the OTA data could not be read at all
 #[must_use]
 pub fn state_str() -> &'static str {
