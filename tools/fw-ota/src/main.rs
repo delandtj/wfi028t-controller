@@ -150,9 +150,60 @@ fn default_elf_path() -> PathBuf {
         .join("wfi-controller-fw")
 }
 
-/// The firmware's own version, read out of `fw/Cargo.toml` so a push labels
-/// the image with the version the firmware reports in its hello line.
+/// The firmware's build stamp, worked out the way `fw/build.rs` does it
+/// (`<crate version>+<commit>[-dirty]`), so a push labels the image with what
+/// the device will report in its hello line. The header field holds
+/// [`header::FW_VERSION_LEN`] bytes; a stamp that does not fit drops the crate
+/// version (`fd17171-dirty`), which is the part that never changes.
 fn firmware_version() -> String {
+    let stamp = match git_stamp() {
+        Some(commit) => format!("{}+{commit}", crate_version()),
+        None => crate_version(),
+    };
+    if stamp.len() <= header::FW_VERSION_LEN {
+        return stamp;
+    }
+    match stamp.split_once('+') {
+        Some((_, commit)) => commit.to_string(),
+        None => stamp,
+    }
+}
+
+/// `<commit>[-dirty]` of the firmware sources, `None` outside a checkout.
+/// Same sources as `fw/build.rs`'s `SOURCES`.
+fn git_stamp() -> Option<String> {
+    let fw = repo_root().join("fw");
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .current_dir(&fw)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let commit = git(&["rev-parse", "--short=7", "HEAD"])?;
+    let dirty = git(&[
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+        "--",
+        ".",
+        "../hp-model",
+        "../Cargo.toml",
+        "../Cargo.lock",
+    ])
+    .is_some_and(|changes| !changes.is_empty());
+    Some(if dirty {
+        format!("{commit}-dirty")
+    } else {
+        commit
+    })
+}
+
+/// The `version` of `fw/Cargo.toml`'s `[package]`, or `unknown`.
+fn crate_version() -> String {
     let manifest = repo_root().join("fw").join("Cargo.toml");
     let Ok(text) = fs::read_to_string(&manifest) else {
         return "unknown".to_string();

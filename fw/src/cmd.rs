@@ -333,12 +333,14 @@ fn status_reply() -> Line {
     // The two ADR 0002 fields, at the end for the same reason the mqtt ones
     // are: a host parser reads `# ` lines as opaque text. `ota=` is the
     // running image's OTA verdict (`pending` while it is on probation), and
-    // `console=` says whether somebody is attached to port 4001.
+    // `console=` says whether somebody is attached to port 4001. `fw=` is the
+    // build stamp from `build.rs`, the same text the hello line carries.
     let _ = write!(
         reply,
-        " ota={} console={}",
+        " ota={} console={} fw={}",
         crate::ota::state_str(),
         crate::net::console_state(),
+        env!("FW_VERSION"),
     );
 
     if reply.push_str("\r\n").is_err() {

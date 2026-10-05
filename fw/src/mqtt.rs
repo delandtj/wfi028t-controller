@@ -868,7 +868,7 @@ async fn publish_discovery(client: &mut Mqtt<'_, '_>) -> Result<(), Trouble> {
         name.clear();
         payload.clear();
         let built = entity::write_discovery_topic(&mut name, descriptor).is_ok()
-            && entity::write_discovery(&mut payload, descriptor, env!("CARGO_PKG_VERSION")).is_ok();
+            && entity::write_discovery(&mut payload, descriptor, env!("FW_VERSION")).is_ok();
         if !built {
             // A buffer too small is our bug, not the broker's; name the entity
             // instead of publishing a truncated config.

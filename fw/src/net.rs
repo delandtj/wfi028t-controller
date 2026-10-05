@@ -327,7 +327,7 @@ async fn serve_client(
     let replay = crate::line_bus().pending(*cursor);
     let hello_ok = sniffer::format_hello(
         DEVICE_NAME,
-        env!("CARGO_PKG_VERSION"),
+        env!("FW_VERSION"),
         Instant::now().as_millis(),
         crate::current_bus(),
         replay,
@@ -444,7 +444,7 @@ async fn serve_console(socket: &mut TcpSocket<'static>, cursor: &mut u64) {
     let mut hello = Line::new();
     let hello_ok = sniffer::format_hello(
         DEVICE_NAME,
-        env!("CARGO_PKG_VERSION"),
+        env!("FW_VERSION"),
         Instant::now().as_millis(),
         crate::current_bus(),
         // No replay on this port, and the hello line says so.
