@@ -67,10 +67,16 @@ views:
   - title: Pool heat pump
     path: heat-pump
     icon: mdi:hot-tub
-    cards:
+    type: sections
+    max_columns: 3
+    sections:
       # --- Control ---------------------------------------------------------
-      - type: vertical-stack
+      - type: grid
         cards:
+          - type: heading
+            heading: Control
+            heading_style: title
+
           - type: conditional
             conditions:
               - condition: state
@@ -85,12 +91,16 @@ views:
           - type: tile
             entity: switch.wfi028t_power
             name: Power
+            grid_options:
+              columns: 12
             features:
               - type: toggle
 
           - type: tile
             entity: select.wfi028t_mode
             name: Mode
+            grid_options:
+              columns: 12
             features:
               - type: select-options
 
@@ -100,6 +110,8 @@ views:
               - condition: state
                 entity: select.wfi028t_mode
                 state: heat
+            grid_options:
+              columns: 12
             card:
               type: tile
               entity: number.wfi028t_p01
@@ -113,6 +125,8 @@ views:
               - condition: state
                 entity: select.wfi028t_mode
                 state: cool
+            grid_options:
+              columns: 12
             card:
               type: tile
               entity: number.wfi028t_p02
@@ -126,6 +140,8 @@ views:
               - condition: state
                 entity: select.wfi028t_mode
                 state: auto
+            grid_options:
+              columns: 12
             card:
               type: tile
               entity: number.wfi028t_p03
@@ -148,9 +164,11 @@ views:
 
       # --- At a glance -----------------------------------------------------
       - type: grid
-        columns: 3
-        square: false
         cards:
+          - type: heading
+            heading: At a glance
+            heading_style: title
+
           - type: tile
             entity: sensor.wfi028t_inlet_water
             name: Water in
@@ -180,78 +198,111 @@ views:
             name: Flow fault
 
       # --- Trends ----------------------------------------------------------
-      - type: history-graph
-        title: Water and air
-        hours_to_show: 24
-        entities:
-          - entity: sensor.wfi028t_inlet_water
-            name: In
-          - entity: sensor.wfi028t_outlet_water
-            name: Out
-          - entity: sensor.wfi028t_ambient
-            name: Air
+      - type: grid
+        cards:
+          - type: heading
+            heading: Trends
+            heading_style: title
 
-      - type: history-graph
-        title: Compressor
-        hours_to_show: 24
-        entities:
-          - entity: sensor.wfi028t_compressor_hz
-            name: Actual
-          - entity: sensor.wfi028t_compressor_target_hz
-            name: Target
-          - entity: sensor.wfi028t_compressor_current
-            name: Current
+          - type: history-graph
+            title: Water and air
+            hours_to_show: 24
+            entities:
+              - entity: sensor.wfi028t_inlet_water
+                name: In
+              - entity: sensor.wfi028t_outlet_water
+                name: Out
+              - entity: sensor.wfi028t_ambient
+                name: Air
+
+          - type: history-graph
+            title: Compressor
+            hours_to_show: 24
+            entities:
+              - entity: sensor.wfi028t_compressor_hz
+                name: Actual
+              - entity: sensor.wfi028t_compressor_target_hz
+                name: Target
+              - entity: sensor.wfi028t_compressor_current
+                name: Current
 
       # --- Refrigerant circuit --------------------------------------------
-      - type: entities
-        title: Circuit
-        entities:
-          - entity: sensor.wfi028t_exhaust
-            name: Exhaust
-          - entity: sensor.wfi028t_gas_return
-            name: Gas return
-          - entity: sensor.wfi028t_outer_piping
-            name: Outer piping
-          - entity: sensor.wfi028t_inner_piping
-            name: Inner piping
-          - entity: sensor.wfi028t_radiator
-            name: Radiator
-          - type: divider
-          - entity: sensor.wfi028t_eev_steps
-            name: EEV aperture
-          - entity: sensor.wfi028t_dc_bus_volts
-            name: DC bus
-          - entity: sensor.wfi028t_fan_rpm
-            name: Fan
-          - entity: sensor.wfi028t_fan2_rpm
-            name: Second fan
-          - entity: binary_sensor.wfi028t_run_permitted
-            name: Run permitted
-          - entity: binary_sensor.wfi028t_boost_active
-            name: Boost active
-          - entity: number.wfi028t_p04
-            name: Restart hysteresis
+      - type: grid
+        cards:
+          - type: heading
+            heading: Circuit
+            heading_style: title
+
+          - type: entities
+            entities:
+              - entity: sensor.wfi028t_exhaust
+                name: Exhaust
+              - entity: sensor.wfi028t_gas_return
+                name: Gas return
+              - entity: sensor.wfi028t_outer_piping
+                name: Outer piping
+              - entity: sensor.wfi028t_inner_piping
+                name: Inner piping
+              - entity: sensor.wfi028t_radiator
+                name: Radiator
+              - type: divider
+              - entity: sensor.wfi028t_eev_steps
+                name: EEV aperture
+              - entity: sensor.wfi028t_dc_bus_volts
+                name: DC bus
+              - entity: sensor.wfi028t_fan_rpm
+                name: Fan
+              - entity: sensor.wfi028t_fan2_rpm
+                name: Second fan
+              - entity: binary_sensor.wfi028t_run_permitted
+                name: Run permitted
+              - entity: binary_sensor.wfi028t_boost_active
+                name: Boost active
+              - entity: number.wfi028t_p04
+                name: Restart hysteresis
 
       # --- Diagnostics -----------------------------------------------------
-      - type: entities
-        title: Controller
-        entities:
-          - entity: binary_sensor.wfi028t_link
-            name: Modbus link
-          - entity: sensor.wfi028t_controller_mode
-            name: Controller mode
-          - entity: sensor.wfi028t_last_command
-            name: Last command
-          - type: divider
-          - entity: sensor.wfi028t_requests
-            name: Bus requests
-          - entity: sensor.wfi028t_timeouts
-            name: Bus timeouts
-          - entity: sensor.wfi028t_writes
-            name: Block writes
-          - entity: sensor.wfi028t_write_failures
-            name: Failed commands
+      - type: grid
+        cards:
+          - type: heading
+            heading: Controller
+            heading_style: title
+
+          - type: entities
+            entities:
+              - entity: binary_sensor.wfi028t_link
+                name: Modbus link
+              - entity: sensor.wfi028t_controller_mode
+                name: Controller mode
+              - entity: sensor.wfi028t_last_command
+                name: Last command
+              - type: divider
+              - entity: sensor.wfi028t_requests
+                name: Bus requests
+              - entity: sensor.wfi028t_timeouts
+                name: Bus timeouts
+              - entity: sensor.wfi028t_writes
+                name: Block writes
+              - entity: sensor.wfi028t_write_failures
+                name: Failed commands
 ```
+
+## Layout
+
+The view is a **sections** view, so each section is a column and sections sit
+next to one another; `max_columns: 3` is the ceiling. Home Assistant drops to
+fewer columns as the window narrows, and to one on a phone - a view that
+stacks everything on a wide screen is usually a masonry view, which flows
+cards into columns by height instead of letting you place them.
+
+Within a section the grid is 12 units wide. A `tile` takes 6 by default, so
+the glance tiles pair up two per row; the control rows carry
+`grid_options: {columns: 12}` to stay full width, and `entities` and
+`history-graph` cards are full width already.
+
+To force two specific cards side by side regardless of view type, a
+`horizontal-stack` does it - but it splits the width evenly and does not
+reflow on a phone, so it is the wrong tool for a whole dashboard.
 
 ## Notes
 
