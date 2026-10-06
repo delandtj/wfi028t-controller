@@ -36,14 +36,12 @@ with the ADRs.
 - 0x003f is the main bit field: bit 0 on/off, bit 4 P05, bit 6 ECO (cleared =
   full power). Mode is 0x0040. Setpoints are whole degrees; sensors are mostly
   raw/2, inlet water raw/10, exhaust raw.
-- The vendor's sheet says the stock controller must be unplugged when an
-  external master is used. It is wrong about the boost bit, so trust captures
-  over documents.
-
-Vendor documents are in [`docs/vendor/`](docs/vendor) with plain-text
-extractions. `communication-protocol-v1.3.2-eng` is for a different product
-(air-to-water) and does NOT match this bus; it may still describe extra areas
-of the same PCB (0x0300 user area, 0x0360 version), untested.
+- The stock controller must be unplugged when an external master is used.
+- The heat pump mainboard's own Modbus protocol is in
+  [`docs/vendor/`](docs/vendor) (PDF plus a plain-text transcription, `.md`),
+  next to the user manual. It matches the bus everywhere except the boost
+  bit, so trust captures over documents;
+  [`docs/register-map.md`](docs/register-map.md) has the comparison.
 
 [`docs/home-assistant-dashboard.md`](docs/home-assistant-dashboard.md) is the
 HA side: the entity ids the firmware publishes and a dashboard built from

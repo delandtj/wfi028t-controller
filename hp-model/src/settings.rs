@@ -43,9 +43,9 @@ pub const BIT_ECO: u8 = 6;
 pub enum Mode {
     /// 1, confirmed on this unit.
     Heat,
-    /// 2, from the WFI sheet.
+    /// 2, from the vendor protocol.
     Cool,
-    /// 7, from the WFI sheet.
+    /// 7, from the vendor protocol.
     Auto,
     /// Anything else, preserved so a readback never loses information.
     Other(u16),
@@ -235,8 +235,9 @@ impl Settings {
     }
 
     /// 0x003f bit 6, **inverted**: the bit is set for normal/ECO and clear
-    /// for full power, so boost is on when the bit is clear. The WFI sheet
-    /// claims boost lives in 0x0040 bit 4; the capture disagrees.
+    /// for full power, so boost is on when the bit is clear. The vendor
+    /// protocol calls this bit "silent mode" and claims boost lives in 0x0040
+    /// bit 4; the capture disagrees.
     #[must_use]
     pub fn boost(&self) -> bool {
         !self.flag(BIT_ECO)
