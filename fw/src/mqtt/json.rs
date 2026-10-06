@@ -150,8 +150,8 @@ pub fn write_state(out: &mut dyn Write, view: &View<'_>) -> core::fmt::Result {
             doc.flag("water_flow_fault", status.water_flow_fault())?;
             doc.flag("boost_active", status.boost_active())?;
             doc.flag("water_pump", status.water_pump())?;
-            doc.flag("heating_active", status.heating_active())?;
-            doc.flag("run_permitted", status.run_permitted())?;
+            doc.flag("heating_active", status.compressor_output())?;
+            doc.flag("run_permitted", status.heating_demand())?;
             doc.flag("compressor_running", status.compressor_running())?;
         }
         None => doc.all_null(&[

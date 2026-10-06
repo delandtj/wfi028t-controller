@@ -290,8 +290,8 @@ pub const ENTITIES: &[Entity] = &[
     ),
     binary("boost_active", "Boost active", None, false),
     binary("water_pump", "Water pump", None, false),
-    binary("heating_active", "Heating active", None, false),
-    binary("run_permitted", "Run permitted", None, false),
+    binary("heating_active", "Compressor output", None, false),
+    binary("run_permitted", "Heating demand", None, false),
     binary(
         "compressor_running",
         "Compressor running",

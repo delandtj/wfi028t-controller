@@ -217,45 +217,51 @@ impl Status {
     }
 
     // --- Status and alarm bits (register-map.md "Status and alarms") ---
+    //
+    // Bit meanings from the vendor protocol document (docs/vendor/, "Flag
+    // descriptions"), each checked against 52 h of bus captures.
 
-    /// Water flow alarm, 0x0002 bit 1. Confirmed by the flow test: set 2 s
-    /// after the circulation stopped, self-clearing when flow returns.
+    /// Water flow switch fault, 0x0008 bit 0 ("fault flags 2"). Set 10 s into
+    /// the flow test, cleared when the flow returned. (0x0002 bit 1, which
+    /// this used to read, sets at every thermostat stop: not a flow alarm.)
     #[must_use]
     pub fn water_flow_fault(&self) -> bool {
-        self.bit(0x0002, 1)
+        self.bit(0x0008, 0)
     }
 
-    /// Full power (boost) active, 0x0004 bit 7: the heat pump's confirmation
-    /// of the 0x003f bit 6 request. Confirmed.
+    /// High fan speed, 0x0004 bit 7. Mirrors boost (0x003f bit 6 clear) in
+    /// every capture, so it doubles as the heat pump's confirmation of it.
     #[must_use]
     pub fn boost_active(&self) -> bool {
         self.bit(0x0004, 7)
     }
 
-    /// Water pump relay output, 0x0004 bit 5. Likely: on about 2 min before
-    /// each compressor start, off after a power-off or a flow fault.
+    /// Circulating water pump output, 0x0006 bit 2 ("output flags 3"). On
+    /// with the unit, off about 45 s after a compressor stop or a power-off.
     #[must_use]
     pub fn water_pump(&self) -> bool {
+        self.bit(0x0006, 2)
+    }
+
+    /// Fan output, 0x0004 bit 5. Rises 5-6 s before the fan speed reads
+    /// non-zero; matches fan speed > 0 in 99.98% of the captures.
+    #[must_use]
+    pub fn fan_running(&self) -> bool {
         self.bit(0x0004, 5)
     }
 
-    /// Heating active (or compressor enable), 0x0004 bit 0. Candidate.
+    /// Compressor 1 output, 0x0004 bit 0: the run command, set with the
+    /// target frequency and 9-12 s before the compressor turns.
     #[must_use]
-    pub fn heating_active(&self) -> bool {
+    pub fn compressor_output(&self) -> bool {
         self.bit(0x0004, 0)
     }
 
-    /// Run permitted: unit on and no blocking fault, 0x0005 bit 7. Likely.
+    /// Heating demand, 0x0005 bit 7 ("output flags 2"): on while the unit
+    /// wants heat, off at a thermostat stop and at a power-off.
     #[must_use]
-    pub fn run_permitted(&self) -> bool {
+    pub fn heating_demand(&self) -> bool {
         self.bit(0x0005, 7)
-    }
-
-    /// Compressor stopped by a protection, 0x0008 bit 0. Candidate from the
-    /// water flow test (set 10 s into the fault, cleared when it went away).
-    #[must_use]
-    pub fn stopped_by_protection(&self) -> bool {
-        self.bit(0x0008, 0)
     }
 }
 
@@ -368,15 +374,16 @@ mod tests {
 
     #[test]
     fn snapshot_bits_are_the_logged_state() {
-        // 0x0004 = 0x0021: bit 0 heating active, bit 5 water pump, bit 7
-        // clear (ECO, not boost). 0x0005 = 0x0080: bit 7 run permitted.
+        // 0x0004 = 0x0021: bit 0 compressor, bit 5 fan, bit 7 clear (ECO,
+        // not boost). 0x0005 = 0x0080: heating demand. 0x0006 = 0x0014:
+        // bit 2 water pump.
         let s = snap();
-        assert!(s.heating_active());
+        assert!(s.compressor_output());
+        assert!(s.fan_running());
         assert!(s.water_pump());
         assert!(!s.boost_active());
-        assert!(s.run_permitted());
+        assert!(s.heating_demand());
         assert!(!s.water_flow_fault());
-        assert!(!s.stopped_by_protection());
     }
 
     #[test]
@@ -386,28 +393,35 @@ mod tests {
         block[0x0004] = 161;
         let s = Status::from_block(block);
         assert!(s.boost_active());
-        assert!(s.heating_active());
-        assert!(s.water_pump());
+        assert!(s.compressor_output());
+        assert!(s.fan_running());
     }
 
     #[test]
     fn water_flow_fault_sequence() {
-        // 16:57:15 flow fault, then 16:57:25 run permitted clears, heating
-        // clears, 0x0008 bit 0 sets.
+        // 16:57:15 0x0002 bit 1 sets (thermostat-stop flag, not the fault);
+        // 16:57:25 compressor and heating demand clear and 0x0008 bit 0
+        // sets; 16:58:10 pump and fan off.
         let mut block = STATUS_BLOCK;
         block[0x0002] = 0x0002;
         let s = Status::from_block(block);
-        assert!(s.water_flow_fault());
-        assert!(s.run_permitted());
+        assert!(!s.water_flow_fault());
+        assert!(s.heating_demand());
 
         block[0x0004] &= !0x0001;
         block[0x0005] &= !0x0080;
         block[0x0008] |= 0x0001;
         let s = Status::from_block(block);
         assert!(s.water_flow_fault());
-        assert!(!s.heating_active());
-        assert!(!s.run_permitted());
-        assert!(s.stopped_by_protection());
+        assert!(!s.compressor_output());
+        assert!(!s.heating_demand());
+        assert!(s.water_pump());
+
+        block[0x0004] &= !0x0020;
+        block[0x0006] = 0;
+        let s = Status::from_block(block);
+        assert!(!s.fan_running());
+        assert!(!s.water_pump());
     }
 
     #[test]
