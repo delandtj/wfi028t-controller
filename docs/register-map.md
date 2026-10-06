@@ -10,12 +10,23 @@ Sources, in order of trust:
 1. **Capture** - sniffed traffic in /var/lib/modbus-sniffer on the capture
    server (recorded with ../stm32-modbus-sniffer) (start of the real
    capture is marked by the note "CAPTURE START real bus", 2026-10-03 14:51).
-2. **WFI sheet** - `vendor/modbus-protocol-wfi.pdf` / `.txt`, "Tri-phase" section.
+2. **Vendor protocol** -
+   `vendor/modbus-protocol-zhike-inverter-pool-heat-pump-2022-03-29-en.pdf`:
+   "Zhike three-phase inverter swimming pool heat pump - mainboard
+   communication protocol" (2022-03-29, document RCDF211268, English
+   translation). The full map: every register of both blocks plus 0x0082,
+   and the bit meanings of the flag registers. Checked against 52 h of
+   capture (2026-10-03..06, see "Vendor document vs capture"): every
+   address it names matches what the bus shows, and it corrected three of
+   our status-bit labels. It is still wrong about boost (same claim as the
+   WFI sheet), gives no scaling, and calls two registers we use "reserved".
+3. **WFI sheet** - `vendor/modbus-protocol-wfi.pdf` / `.txt`, "Tri-phase" section,
+   an excerpt of the vendor protocol.
    Matches the bus for 0x003f bit 0 and 0x0040, but is WRONG about boost (see
    below), so verify every entry before relying on it.
-3. **Manual** - `vendor/wfi-028t-035t-manual.pdf`: user parameters P01-P05, running
+4. **Manual** - `vendor/wfi-028t-035t-manual.pdf`: user parameters P01-P05, running
    values A01-A14, error codes E04..E27.
-4. **Generic protocol** - `vendor/communication-protocol-v1.3.2-eng.docx` / `.txt`.
+5. **Generic protocol** - `vendor/communication-protocol-v1.3.2-eng.docx` / `.txt`.
    Written for an air-to-water heat pump; its map does NOT match this bus
    (it calls 0x003f "Reserve" and 0x0040 "Compressor frequency", read-only,
    while the controller writes both). Possibly the same PCB maker. Its extra
@@ -81,24 +92,36 @@ Setpoints in the settings block are whole degrees (unlike the sensors).
 - (P01-P05 now confirmed; 0x0042 turned out to be P02, not P01.)
 - The live sensors are mapped (see "Sensors" under the ESPHome target).
 
-Unmapped part of the settings block. Values have been constant since the start
-of the capture (see the snapshot at the end); the meanings are guesses from the
-value patterns only:
+The rest of the settings block, named by the vendor protocol. Values have
+been constant since the start of the capture (see the snapshot at the end).
+Where a vendor default is given it matches the captured value, which is the
+evidence for the names; none of these has been written yet.
 
-| Registers | Values | Guess |
+| Registers | Values | Vendor name (range, default) |
 |---|---|---|
-| 0x0043, 0x0044 | 50, 150 | limits or setpoints (50 = max water temp?) |
-| 0x0045, 0x0046, 0x0047, 0x0048, 0x004c | -1, -1, 0x7fff, -1, -1 | unused / not set |
-| 0x0049, 0x004b | 500, 10 | 500 = EEV max steps, or 50.0 of something? |
-| 0x004e-0x0051 | 0, -20, 40, -6 | -20..40 looks like an ambient range; -6 a defrost start temp? |
-| 0x0052-0x0058 | 11, 16, 6, 17, 30, 1, 88 | defrost interval / exit temp / max duration? 88 a temp limit? |
-| 0x0059-0x005c | 40, 8, 1, 23 | unknown |
-| 0x005d-0x006b | 40 44 48 54 58 64 72 80 84 90 95 100 105 110 115 | 15-step compressor frequency ladder (Hz); boost ran at 80, settled at 72 |
-| 0x006c-0x0074 | 12 13 14 / 46 52 58 64 72 85 | second frequency table (ECO, or per ambient band?), first three maybe thresholds |
-| 0x0075-0x0081 | 0,1, 12,-1, 0,8, 0,12, 0,14, 0,17, 0 | 8/12/14/17 look like clock hours: the timer schedules? |
+| 0x0043 | 50 | manual frequency setting |
+| 0x0044 | 150 | manual EXV step position (20-450, 300) |
+| 0x0045-0x0048 | -1, -1, 0x7fff, -1 | manual aux valve, manual frequency 2, manual EXV 2, manual aux valve 2 (second circuit, not fitted) |
+| 0x0049 | 500 | manual fan speed |
+| 0x004b, 0x004f, 0x005c | 10, -20, 23 | reserved |
+| 0x004c | -1 | mode changeover time (3-30 min, 10) - not set on this unit |
+| 0x004e | 0 | inlet water temperature compensation |
+| 0x0050-0x0055 | 40, -6, 11, 16, 6, 17 | defrost: interval 20-90 min, start temp -15..-1 C, duration 5-20 min, termination temp 1-40 C, ambient-to-coil difference 0-15 C, ambient threshold 0-20 C (all at the vendor defaults) |
+| 0x0056-0x0058 | 30, 1, 88 | EXV adjustment period 20-90 s, heating target superheat -5..10 C, EXV discharge-temperature target 70-125 C |
+| 0x0059, 0x005a | 40, 8 | EXV opening during defrost (20-450, 400), minimum EXV opening (50-150, 80): stored in units of 10 steps |
+| 0x005b | 1 | cooling target superheat (-5..10 C) |
+| 0x005d-0x0066 | 40 44 48 54 58 64 72 80 84 90 | compressor frequency ladder F1-F10 (30-90 Hz); boost ran at 80, settled at 72 |
+| 0x0067-0x006b | 95 100 105 110 115 | discharge temperature thresholds TP0-TP4 (50-125 C), not frequencies |
+| 0x006c-0x006e | 12, 13, 14 | reserved |
+| 0x006f-0x0074 | 46 52 58 64 72 85 | fan speed levels 1-6 (20-100) |
+| 0x0075, 0x0076 | 0, 1 | fan speed level selection (0-6), fan type (0 AC, 1 DC, 2 EC) |
+| 0x0077, 0x0078 | 12, -1 | reserved |
+| 0x0079 | 0 | timer enable flags |
+| 0x007a-0x0081 | 8,0, 12,0, 14,0, 17,0 | timer 1 on/off, timer 2 on/off (hour, minute): 08:00-12:00 and 14:00-17:00 |
+| 0x0082 | - | vendor "control switch" flags, RW; outside the block the stock controller reads |
 
-These are likely installer/factory protection parameters. Do not write changed
-values blind; map them by changing one installer-menu parameter at a time.
+These are installer/factory protection parameters. Do not write changed
+values blind; the names make a change targeted, not safe.
 
 ## Target: ESPHome replacement controller
 
@@ -165,14 +188,16 @@ while running), and the 0x7fff "not present" slots 0x0016, 0x0017, 0x0019,
 
 | Entity | ESPHome type | Register | Status |
 |---|---|---|---|
-| Boost active (heat pump confirmation) | `binary_sensor` | 0x0004 bit 7 | confirmed |
-| Run permitted (unit on and no blocking fault) | `binary_sensor` | 0x0005 bit 7 | likely (clears at power-off AND during the water flow fault while still on) |
-| Water pump output (heat pump's pump relay) | `binary_sensor` | 0x0004 bit 5 | likely (off after power-off and after the flow fault; on ~2 min before each compressor start) |
-| Heating active (or compressor enable) | `binary_sensor` | 0x0004 bit 0 | candidate (off at power-off, on 5 s after pump start) |
+| Boost active / high fan speed | `binary_sensor` | 0x0004 bit 7 | confirmed (vendor: high/low fan speed; mirrors 0x003f bit 6 in 99.99% of samples) |
+| Heating demand (HA id `run_permitted`) | `binary_sensor` | 0x0005 bit 7 | confirmed (vendor: AC heating demand; off at thermostat stops and power-off) |
+| Water pump | `binary_sensor` | 0x0006 bit 2 | confirmed (vendor: circulating water pump; on with the unit, off ~45 s after a compressor stop) |
+| Fan output | (not published yet) | 0x0004 bit 5 | confirmed (vendor: fan; leads fan rpm > 0 by 5-6 s, 99.98% agreement). Was mislabelled "water pump" before 2026-10-06 |
+| Compressor output (HA id `heating_active`) | `binary_sensor` | 0x0004 bit 0 | confirmed (vendor: compressor 1; set with the target frequency, 9-12 s before the compressor turns) |
 | Compressor running | `binary_sensor` | derive from 0x001b > 0 or current 0x0020 > 0 | derived |
-| Defrosting | `binary_sensor` | status block | to map (wait for a defrost) |
-| Water flow alarm | `binary_sensor` | 0x0002 bit 1 | confirmed (flow test 16:57-17:01; set 2 s after flow stopped, self-clears when flow returns) |
-| Any fault | `binary_sensor` | status block | to map |
+| Defrosting | `binary_sensor` | 0x0003 bit 7, 0x0004 bit 6 (four-way valve) | vendor; never set in 52 h of capture (no cold-weather run yet) |
+| Water flow fault | `binary_sensor` | 0x0008 bit 0 | confirmed (vendor: water flow switch fault; set 10 s into the flow test 16:57). Read 0x0002 bit 1 before 2026-10-06 - wrong, see below |
+| Thermostat stop flag | - | 0x0002 bit 1 | observed only: sets at every compressor stop, clears at the next start or a morning reset; not in the vendor document |
+| Any fault | `binary_sensor` | 0x0007-0x000d nonzero, 0x001c/0x001d inverter fault codes | vendor (bit list in the PDF); only 0x0008 bit 0 seen so far |
 | Active error code + description | `text_sensor` | status block | to map |
 | Modbus link status, raw status words | diagnostics | - | ESPHome built-in / raw reads |
 
@@ -205,6 +230,31 @@ WiFi icon (Tuya module, no longer relevant).
 - **No climate platform in `modbus_controller`:** a thermostat card needs an
   ESPHome external component or an HA-side template; plain entities work
   without it.
+
+## Vendor document vs capture
+
+The vendor protocol checked against all captures 2026-10-03..06 (52.7 h,
+7 compressor cycles, 1 s samples). Where the two disagree the capture wins.
+
+| Item | Vendor document | Capture | Verdict |
+|---|---|---|---|
+| Framing, slave | 9600 8N1, slave 1-16 by DIP switches 1-4 | 9600 8N1, slave 0x01 | agree; other units may sit at another address |
+| 0x06 write | echo on success, otherwise no response | stock controller only uses 0x10 | no exception responses: a bad write times out |
+| Temperatures 0x000f-0x0015, 0x0026-0x0029 | names and ranges, no scaling | /10 inlet, /2 most, x1 discharge | agree; scaling is ours |
+| 0x001a, 0x001b | compressor 1 target / actual frequency | target leads actual | agree (target now confirmed) |
+| 0x001c, 0x001d | inverter module 1 fault codes | always 0 | new, unobserved |
+| 0x001f | reserved | 80 (A10 radiator 40 C), moves 80-86 only at ~79 Hz | keep ours, weak |
+| 0x0020 | reserved | 0 when stopped, ~0.14 x Hz running (A09) | ours: compressor current |
+| 0x0002 | control switch flags (bit 6 water flow) | bit 1 at thermostat stops, bit 6 never | vendor table looks misplaced (printed under 0x0082); bit 1 unexplained |
+| 0x0003 | work status (bit 0 hot water, 2 heating, 3 cooling, 7 defrost) | constant 0x000d | not usable as a mode indication |
+| 0x0004 | bit 0 compressor 1, 5 fan, 6 four-way valve, 7 high fan speed | as stated; bit 6 never set | vendor right; our bit 5 "water pump" was the fan |
+| 0x0005 bit 7 | AC heating demand | follows the compressor demand | vendor right ("run permitted" was a guess) |
+| 0x0006 | bit 1 crankcase heater, bit 2 water pump | bit 1 on with the compressor off in the night, bit 2 with the pump | vendor right; bit 4 (unlisted) tracks the compressor |
+| 0x0008 bit 0 | water flow switch fault | set during the flow test | vendor right; this is the flow fault |
+| 0x003f bit 4 | water pump mode: 0 continuous, 1 periodic | P05 (1 = stop at target) | same switch, two names |
+| 0x003f bit 6 | silent mode | 1 = ECO, 0 = boost | same switch; ECO is silent mode |
+| 0x003f bits 13, 14 | fan mode, forced defrost | 0 throughout | untested; bit 14 is the candidate for a manual defrost |
+| 0x0040 bit 4 | boost on/off | never changes when boost is toggled | vendor wrong (as the WFI sheet) |
 
 ## Observed sequences
 

@@ -2,6 +2,8 @@
 
 **Status**: Proposed
 **Date**: 2026-10-04
+**Updated**: 2026-10-06 (vendor protocol: the slave address is 1-16 by DIP
+switch, and writes get no exception response; discovery adapts)
 
 ---
 
@@ -106,8 +108,9 @@ master. Steps:
    first (the measured one), then 9600 8E1, 9600 8N2, 4800 8N1, 19200 8N1 -
    listen 3 s and count CRC-good frames, UART errors and raw bytes.
    - CRC-good frames with the stock controller's pattern (reads of
-     0x0000 x 63 and 0x003f x 67 from slave 0x01, about once a second):
-     configuration found, stock controller present. The heat pump's answers
+     0x0000 x 63 and 0x003f x 67, about once a second): configuration
+     found, stock controller present, and the slave address is whatever it
+     polls. The heat pump's answers
      are decoded passively and shown ("inlet 33 C, heating, P01 33") so the
      user sees it is the right machine before anything else happens.
    - Bytes but no valid frame on any configuration, or framing errors: "wiring
@@ -119,10 +122,13 @@ master. Steps:
    has been silent for the 3 s silence check. Traffic resuming later aborts
    the wizard back to listen.
 3. **Probe** (bus proven silent). With the found configuration, or each
-   candidate in turn if none was found, send one read of the status block to
-   slave 0x01 and wait for the answer. No answer on any configuration:
-   "nothing answers - check power and wiring". One read per candidate, never
-   a write.
+   candidate in turn if none was found, send one read of the status block and
+   wait for the answer. The address is the one the stock controller polled;
+   without that, slave 0x01 first, then 2..16 (the vendor protocol sets it by
+   DIP switches 1-4). The heat pump sends no exception responses, so a wrong
+   address or configuration shows as a timeout, nothing more. No answer
+   anywhere: "nothing answers - check power and wiring". One read per
+   candidate, never a write.
 4. **Check plausibility.** Read both blocks with `hp_model`; every decoded
    value must be in its physical or entity range (temperatures -30..100 C,
    setpoints within the entity table, a known mode). Show the summary. A
@@ -209,7 +215,7 @@ station interface only, never on the setup AP.
    - Uses `BusUart::apply` for configuration changes (as the `bus` command
      does), the existing frame classifier for "another master", the existing
      silence check, and `hp_model::rtu` for the probe and the decoding.
-   - Never sends anything but a read of slave 0x01, and only after a silence
+   - Never sends anything but a status-block read, and only after a silence
      check on the configuration under test.
    - Ends by restoring the saved bus configuration unless the user takes
      over.
@@ -265,7 +271,7 @@ power on
 heat pump step (bus task):
   listen per config --> stock controller traffic? --> "unplug it" --> silence
                     --> nothing at all --------------------------> silence
-  silence --> probe read slave 0x01 per config --> plausible? --> take over
+  silence --> probe read slave 1..16 per config --> plausible? --> take over
 ```
 
 ---
@@ -324,7 +330,7 @@ heat pump step (bus task):
 ### Positive
 - Flash, boot, configure from a phone, run: no toolchain change, no console,
   no rebuild for a different network.
-- The bring-up knowledge (unplug first, silence, slave 0x01, plausibility)
+- The bring-up knowledge (unplug first, silence, slave address, plausibility)
   becomes a guided procedure that refuses the unsafe orders.
 - One image fits every installation, which is what makes released binaries
   (ADR 0005) possible.
@@ -413,8 +419,10 @@ the upgrade path, and it is tested on the bench board before the live unit.
   - Alternative: WPA2 with a MAC-derived password.
   - Cost to change later: small in code; needs a way to show the password.
 - **Discovery candidates.**
-  - Choice: 9600 8N1, 8E1, 8N2, 4800 8N1, 19200 8N1; slave 0x01 only.
-  - Alternative: the full baud/parity matrix, or slave scan 1..8.
+  - Choice: 9600 8N1, 8E1, 8N2, 4800 8N1, 19200 8N1; slave 1..16, 0x01
+    first.
+  - Alternative: 9600 8N1 only (the vendor protocol fixes it), or the full
+    baud/parity matrix.
   - Cost to change later: a table; each extra candidate adds 3 s to listen.
 - **Factory reset keeps the bus record.**
   - Choice: keep wiring, forget the owner.

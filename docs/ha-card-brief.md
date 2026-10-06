@@ -37,7 +37,7 @@ actually doing anything.
    its entity attributes. Never a shared range.
 2. Boost and stop-at-target toggles.
 3. Water in, water out, their difference (out - in), air temperature,
-   compressor running/frequency, water pump, heating active.
+   compressor running/frequency, water pump, compressor output.
 4. One status banner, chosen by priority (section 6): controller offline >
    listen mode > Modbus link down > settings not read yet. Show only the
    highest that applies; listen mode also turns `link` off, so a naive card
@@ -210,11 +210,11 @@ Values can be negative. A sensor that is not fitted reads `unknown`
 
 | Entity id | Name | device_class | Meaning |
 |---|---|---|---|
-| `binary_sensor.wfi028t_water_flow_fault` | Water flow fault | problem | The only alarm bit mapped. Self-clears |
+| `binary_sensor.wfi028t_water_flow_fault` | Water flow fault | problem | 0x0008 bit 0 (vendor: water flow switch fault). Self-clears |
 | `binary_sensor.wfi028t_compressor_running` | Compressor running | running | Derived: compressor_hz > 0 |
-| `binary_sensor.wfi028t_water_pump` | Water pump | - | mapping "likely" |
-| `binary_sensor.wfi028t_heating_active` | Heating active | - | mapping "candidate" |
-| `binary_sensor.wfi028t_run_permitted` | Run permitted | - | Clears at power-off and during a flow fault |
+| `binary_sensor.wfi028t_water_pump` | Water pump | - | Circulating pump, 0x0006 bit 2. Runs on ~45 s after a compressor stop |
+| `binary_sensor.wfi028t_heating_active` | Compressor output | - | Compressor run command, 0x0004 bit 0; leads compressor_running by ~10 s. Id kept from the old name |
+| `binary_sensor.wfi028t_run_permitted` | Heating demand | - | 0x0005 bit 7; off at thermostat stops and power-off. Id kept from the old name |
 | `binary_sensor.wfi028t_boost_active` | Boost active | - | Heat pump's confirmation of the boost request; may lag the switch |
 | `binary_sensor.wfi028t_link` | Modbus link | connectivity | Diagnostic. Controller <-> heat pump bus link |
 

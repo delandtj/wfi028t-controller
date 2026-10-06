@@ -255,7 +255,7 @@ views:
               - entity: sensor.wfi028t_fan2_rpm
                 name: Second fan
               - entity: binary_sensor.wfi028t_run_permitted
-                name: Run permitted
+                name: Heating demand
               - entity: binary_sensor.wfi028t_boost_active
                 name: Boost active
               - entity: number.wfi028t_p04
