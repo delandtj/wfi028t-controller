@@ -73,6 +73,9 @@ The sniffer repo stays as the receive-only tool.
 
 ## Hardware
 
+Wiring, build and flash sheet: [docs/wiring.html](docs/wiring.html), also
+online at <https://claude.ai/artifact/Swm2knzTawDmHsjwo6iN2h>.
+
 Same as the sniffer, plus TX:
 
 - ESP32-C6-DevKitC-1 (2.4 GHz WiFi only), RS-485 module (isolated,
