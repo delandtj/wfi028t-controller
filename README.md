@@ -81,9 +81,10 @@ Same as the sniffer, plus TX:
 - ESP32-C6-DevKitC-1 (2.4 GHz WiFi only), RS-485 module (isolated,
   automatic direction): VCC 3V3, GND, RXD -> GPIO4, and its TX-side pin ->
   a free GPIO (proposal GPIO5) as UART1 TX.
-- Bus: controller cable green/yellow = A/B (red/black = 12 V). On this
-  installation the module's A/B had to be swapped relative to the labels:
-  inverted bits show up as `7f`/`fe`/`ff` garbage.
+- Bus: controller cable green -> module A, yellow -> module B (red/black =
+  12 V, not connected). Module markings vary between makers: if the bus reads
+  as `7f`/`fe`/`ff` garbage (inverted bits), swap green and yellow at the
+  module.
 - The stock controller is unplugged when this device is the master; keep it
   as a fallback, never both on the bus.
 
