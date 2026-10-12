@@ -21,6 +21,9 @@ use crate::rtu::{self, SETTINGS_LEN, SETTINGS_START, SETTINGS_WRITE_LEN};
 pub const REG_FLAGS: u16 = 0x003f;
 /// Operating mode.
 pub const REG_MODE: u16 = 0x0040;
+/// Manual compressor frequency, used while [`BIT_MANUAL_FREQ`] is set.
+/// Vendor protocol only; untested on this unit.
+pub const REG_MANUAL_FREQ: u16 = 0x0043;
 /// P01 heating setpoint.
 pub const REG_HEAT_SETPOINT: u16 = 0x0041;
 /// P02 cooling setpoint.
@@ -32,6 +35,8 @@ pub const REG_HYSTERESIS: u16 = 0x004d;
 
 /// 0x003f bit 0: 1 = unit on.
 pub const BIT_POWER: u8 = 0;
+/// 0x003f bit 1: manual compressor frequency (vendor protocol, untested).
+pub const BIT_MANUAL_FREQ: u8 = 1;
 /// 0x003f bit 4: P05, 1 = stop once the target is reached.
 pub const BIT_STOP_AT_TARGET: u8 = 4;
 /// 0x003f bit 6: 1 = normal/ECO, 0 = full power. Inverted, see
@@ -92,6 +97,8 @@ pub enum Field {
     AutoSetpoint,
     /// P04, 0x004d.
     Hysteresis,
+    /// Manual compressor frequency, 0x0043.
+    ManualFreq,
 }
 
 impl Field {
@@ -103,6 +110,7 @@ impl Field {
             Self::CoolSetpoint => REG_COOL_SETPOINT,
             Self::AutoSetpoint => REG_AUTO_SETPOINT,
             Self::Hysteresis => REG_HYSTERESIS,
+            Self::ManualFreq => REG_MANUAL_FREQ,
         }
     }
 
@@ -113,6 +121,9 @@ impl Field {
             Self::HeatSetpoint | Self::AutoSetpoint => (8, 40),
             Self::CoolSetpoint => (8, 28),
             Self::Hysteresis => (1, 18),
+            // The vendor's range for the F1-F10 frequency ladder; it gives
+            // none for the manual frequency itself.
+            Self::ManualFreq => (30, 90),
         }
     }
 }
@@ -136,6 +147,10 @@ pub enum Command {
     SetAutoSetpoint(u8),
     /// P04, 1-18 C.
     SetHysteresis(u8),
+    /// 0x003f bit 1: manual compressor frequency on/off. Bench test only.
+    SetManualFreq(bool),
+    /// 0x0043: manual compressor frequency, 30-90 Hz. Bench test only.
+    SetManualFreqHz(u8),
 }
 
 /// Why a [`Command`] did not produce a new block.
@@ -243,6 +258,18 @@ impl Settings {
         !self.flag(BIT_ECO)
     }
 
+    /// 0x003f bit 1: manual compressor frequency enabled (vendor protocol).
+    #[must_use]
+    pub fn manual_freq(&self) -> bool {
+        self.flag(BIT_MANUAL_FREQ)
+    }
+
+    /// 0x0043: manual compressor frequency, as stored.
+    #[must_use]
+    pub fn manual_freq_hz(&self) -> u16 {
+        self.at(REG_MANUAL_FREQ)
+    }
+
     /// 0x0040 operating mode.
     #[must_use]
     pub fn mode(&self) -> Mode {
@@ -337,6 +364,8 @@ impl Settings {
             Command::SetCoolSetpoint(c) => self.with_field(Field::CoolSetpoint, c),
             Command::SetAutoSetpoint(c) => self.with_field(Field::AutoSetpoint, c),
             Command::SetHysteresis(c) => self.with_field(Field::Hysteresis, c),
+            Command::SetManualFreq(on) => Ok(self.with_flag(BIT_MANUAL_FREQ, on)),
+            Command::SetManualFreqHz(hz) => self.with_field(Field::ManualFreq, hz),
         }
     }
 
@@ -434,6 +463,20 @@ mod tests {
         assert!(!non_stop.stop_at_target());
         assert!(non_stop.power());
         assert!(!non_stop.boost());
+    }
+
+    #[test]
+    fn manual_frequency_touches_bit_1_and_0x0043_only() {
+        let on = snap().apply(Command::SetManualFreq(true)).unwrap();
+        assert_eq!(on.reg(0x003f), Some(0x1073));
+        assert!(on.manual_freq());
+        assert_eq!(on.diff(&snap()).count(), 1);
+
+        let hz = snap().apply(Command::SetManualFreqHz(75)).unwrap();
+        assert_eq!(hz.manual_freq_hz(), 75);
+        assert_eq!(hz.diff(&snap()).count(), 1);
+        assert!(snap().apply(Command::SetManualFreqHz(29)).is_err());
+        assert!(snap().apply(Command::SetManualFreqHz(91)).is_err());
     }
 
     #[test]

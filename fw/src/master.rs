@@ -324,6 +324,8 @@ pub fn write_command(out: &mut Line, command: &Command) -> core::fmt::Result {
         Command::SetCoolSetpoint(v) => write!(out, "p02 {v}"),
         Command::SetAutoSetpoint(v) => write!(out, "p03 {v}"),
         Command::SetHysteresis(v) => write!(out, "p04 {v}"),
+        Command::SetManualFreq(on) => write!(out, "mfreq {}", on_off(*on)),
+        Command::SetManualFreqHz(v) => write!(out, "mfreq_hz {v}"),
     }
 }
 

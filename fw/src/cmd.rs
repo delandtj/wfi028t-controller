@@ -15,6 +15,8 @@
 //! | `set p05 on\|off` | stop once the target is reached |
 //! | `set mode heat\|cool\|auto` | operating mode of the heat pump |
 //! | `set p01..p04 <n>` | setpoints and hysteresis, whole degrees |
+//! | `set mfreq_hz <hz>` | manual compressor frequency, 30-90 (0x0043) |
+//! | `set mfreq on\|off` | manual compressor frequency mode (0x003f bit 1) |
 //! | `mqtt` | report the broker configuration and connection state |
 //! | `mqtt host <ip> [port]` | point at a broker (persisted, overrides the build-time one) |
 //! | `mqtt user <u> <p>` | broker credentials (persisted, never echoed back) |
@@ -269,9 +271,11 @@ fn status_reply() -> Line {
         if let Some(settings) = snapshot.settings {
             let _ = write!(
                 reply,
-                " hp_power={} hp_boost={} hp_mode={} hp_setpoint={}",
+                " hp_power={} hp_boost={} hp_mfreq={} hp_mfreq_hz={} hp_mode={} hp_setpoint={}",
                 u8::from(settings.power()),
                 u8::from(settings.boost()),
+                u8::from(settings.manual_freq()),
+                settings.manual_freq_hz(),
                 match settings.mode() {
                     Mode::Heat => "heat",
                     Mode::Cool => "cool",
@@ -284,10 +288,11 @@ fn status_reply() -> Line {
         if let Some(status) = snapshot.status {
             let _ = write!(
                 reply,
-                " hp_inlet_dc={} hp_outlet_dc={} hp_hz={} hp_fault={}",
+                " hp_inlet_dc={} hp_outlet_dc={} hp_hz={} hp_target_hz={} hp_fault={}",
                 status.inlet_water().map_or(0, |t| t.tenths()),
                 status.outlet_water().map_or(0, |t| t.tenths()),
                 status.compressor_hz().unwrap_or(0),
+                status.compressor_target_hz().unwrap_or(0),
                 u8::from(status.water_flow_fault()),
             );
         }
@@ -536,7 +541,8 @@ async fn set_command(rest: &str) -> Line {
 
 fn parse_set(field: &str, value: &str) -> Result<HpCommand, &'static str> {
     const USAGE: &str = "usage: set power|boost|p05 on|off, set mode heat|cool|auto, \
-                         set p01|p02|p03|p04 <degrees>";
+                         set p01|p02|p03|p04 <degrees>, set mfreq on|off, \
+                         set mfreq_hz <hz>";
 
     let as_bool = || match value {
         v if v.eq_ignore_ascii_case("on") || v == "1" || v.eq_ignore_ascii_case("true") => {
@@ -569,6 +575,13 @@ fn parse_set(field: &str, value: &str) -> Result<HpCommand, &'static str> {
             return Err(USAGE);
         };
         return Ok(HpCommand::SetMode(mode));
+    }
+    // Vendor-protocol manual frequency, for the bench test only: not on MQTT.
+    if field.eq_ignore_ascii_case("mfreq") {
+        return as_bool().map(HpCommand::SetManualFreq).ok_or(USAGE);
+    }
+    if field.eq_ignore_ascii_case("mfreq_hz") {
+        return as_u8().map(HpCommand::SetManualFreqHz).ok_or(USAGE);
     }
     if field.eq_ignore_ascii_case("p01") {
         return as_u8().map(HpCommand::SetHeatSetpoint).ok_or(USAGE);
