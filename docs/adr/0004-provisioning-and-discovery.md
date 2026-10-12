@@ -491,8 +491,19 @@ unit gets it.
 ## Open Questions
 
 **Architecture-changers**
-- [ ] AP+STA at once, or AP-only setup with a reboot to test the network?
-      Decided by a bench test of esp-radio's AP+STA before the WiFi page.
+- [x] AP+STA at once, or AP-only setup with a reboot to test the network?
+      AP+STA (bench, 2026-10-12, esp-radio 1.0.0-beta.1, spike branch
+      e3ca227): switching Station <-> AccessPointStation needs no reboot; the
+      station drops for 150-200 ms per switch and gets the same address back
+      (7 of 7). Cost: +6 KB static RAM for the second stack, +4.6 KB heap
+      while the AP is up, no creep over a 2-minute soak. Neither switches nor
+      scans touch the bus (largest frame gap = the normal cadence). Findings
+      the wifi task has to respect: esp-radio's event channel has two
+      subscribers (a third concurrent `*_async` waiter panics); the default
+      scan finds 1-2 networks, an active scan with 120-300 ms dwell takes
+      about 2.3 s and is what the WiFi page needs; MQTT's reconnect backoff
+      is not reset by a station reconnect. Not yet measured: a phone
+      joining the AP.
 - [x] Does the upgrade path for the live unit (OTA into an image with setup
       mode) need a "configured by build" flag, so it never shows an open AP?
       No (2026-10-12): it behaves as the Expert section says - the AP opens,
