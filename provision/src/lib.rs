@@ -9,3 +9,7 @@
 //! `no_std`, no allocator. `std` is pulled in only for the test build.
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
+
+pub mod dhcp;
+pub mod dns;
+pub mod mdns;
