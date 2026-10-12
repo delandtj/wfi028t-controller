@@ -62,13 +62,6 @@ pub const TCP_PORT: u16 = 4000;
 /// cursor that starts at the live tail (ADR 0002, component 6).
 pub const CONSOLE_PORT: u16 = 4001;
 
-/// DHCP hostname, so the server can reach the controller by name.
-///
-/// Deliberately NOT `modbus-sniffer`: that name belongs to the sniffer box
-/// still in service at 192.168.64.161, and two DHCP clients claiming one name
-/// is how a capture ends up pointed at the wrong device.
-const HOSTNAME: &str = "wfi-controller";
-
 /// Sockets the stack has to manage: the two line-server sockets, the console
 /// socket, the OTA receiver's socket, the MQTT client's socket, and the DHCP
 /// client.
@@ -115,6 +108,14 @@ pub fn console_state() -> &'static str {
 
 /// Bring up the radio, the network stack and the line server.
 ///
+/// `ssid`, `password` and `hostname` are resolved by `main` from the stored
+/// records and the build-time defaults (ADR 0004, component 1); this module
+/// only uses them. The hostname is the name the DHCP server is asked to
+/// register, so the capture daemon can reach the controller by name -
+/// deliberately not `modbus-sniffer`, which belongs to the sniffer box still
+/// in service at 192.168.64.161: two DHCP clients claiming one name is how a
+/// capture ends up pointed at the wrong device.
+///
 /// Returns `false` (after publishing a status line of its own) if the radio
 /// cannot be initialised; the sniffer carries on over USB either way.
 pub fn start(
@@ -122,6 +123,7 @@ pub fn start(
     wifi: esp_hal::peripherals::WIFI<'static>,
     ssid: &'static str,
     password: &'static str,
+    hostname: &'static str,
 ) -> bool {
     let mut controller = match WifiController::new(wifi, ControllerConfig::default()) {
         Ok(controller) => controller,
@@ -147,9 +149,9 @@ pub fn start(
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
 
     let mut dhcp = DhcpConfig::default();
-    let mut hostname = heapless09::String::new();
-    if hostname.push_str(HOSTNAME).is_ok() {
-        dhcp.hostname = Some(hostname);
+    let mut name = heapless09::String::new();
+    if name.push_str(hostname).is_ok() {
+        dhcp.hostname = Some(name);
     }
 
     let (stack, runner) = embassy_net::new(

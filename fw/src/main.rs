@@ -29,7 +29,7 @@
 //! | [`ota`] | signed firmware updates on TCP 4002, probation, rollback |
 //! | [`mqtt`] | MQTT 5 client and Home Assistant discovery |
 //! | [`led`] | status LED |
-//! | [`settings`] | bus configuration, mode and MQTT broker in flash |
+//! | [`settings`] | bus configuration, mode, MQTT broker and the provisioning records in flash |
 //!
 //! Polling does not wait for WiFi: the bus task is spawned before the radio and
 //! keeps running whatever the network does (ADR, "Fails safe"). MQTT is a
@@ -76,7 +76,9 @@ use esp_hal::Async;
 use esp_backtrace as _;
 
 use modbus_sniffer_core as sniffer;
+use provision::records::{Device, Wifi, MAX_HOSTNAME};
 use sniffer::{BusConfig, BusFormat, Chunk, Line, Marker, SnifferBus};
+use static_cell::StaticCell;
 
 mod cmd;
 mod led;
@@ -112,10 +114,26 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// ```
 ///
 /// The variable names are the sniffer's, so one `.cargo/config.toml` serves
-/// both projects. With no SSID the build still succeeds and WiFi is simply not
-/// started.
+/// both projects. With no SSID and no stored WiFi record the build still
+/// succeeds and WiFi is simply not started.
+///
+/// A stored record ([`settings::stored_wifi`]) wins over these: this is the
+/// default a bench build boots onto, not an override (ADR 0004, component 1).
 const WIFI_SSID: Option<&str> = option_env!("SNIFFER_WIFI_SSID");
 const WIFI_PASS: Option<&str> = option_env!("SNIFFER_WIFI_PASS");
+
+/// Hostname at build time, the middle of ADR 0004's three sources:
+///
+/// ```sh
+/// SNIFFER_HOSTNAME=wfi-controller cargo run --release
+/// ```
+///
+/// The live unit at the heat pump is `wfi-controller` and the capture
+/// tooling, the docs and a pile of bookmarks follow that name, so the bench
+/// and release builds for it set this. Without it, and without a stored
+/// device record, the name is [`mac_hostname`]'s `wfi028t-XXXX`, which two
+/// fresh units on one network do not collide on.
+const BUILD_HOSTNAME: Option<&str> = option_env!("SNIFFER_HOSTNAME");
 
 /// Name this device reports in its hello line. Distinct from the sniffer's
 /// `sniffer-esp32c6`, so a capture log says which box produced it.
@@ -356,6 +374,107 @@ fn flush_dropped_marker() {
 }
 
 // ---------------------------------------------------------------------------
+// Identity: station credentials and hostname
+// ---------------------------------------------------------------------------
+
+/// The stored records, promoted to `'static`: the radio and the DHCP client
+/// borrow the strings inside them for as long as the firmware runs, and
+/// nothing re-reads them (a change applies at the next reboot).
+static STORED_WIFI: StaticCell<Wifi> = StaticCell::new();
+static STORED_DEVICE: StaticCell<Device> = StaticCell::new();
+static MAC_HOSTNAME: StaticCell<heapless::String<MAX_HOSTNAME>> = StaticCell::new();
+
+/// The SSID the radio was started with, so the `wifi` command can say when
+/// what is on flash is not yet what is on the air. Empty if WiFi never
+/// started.
+static STATION_SSID: BlockingMutex<CriticalSectionRawMutex, core::cell::Cell<&'static str>> =
+    BlockingMutex::new(core::cell::Cell::new(""));
+
+/// The SSID the station is using. Empty if the radio never started.
+#[must_use]
+pub fn current_ssid() -> &'static str {
+    STATION_SSID.lock(core::cell::Cell::get)
+}
+
+/// Station credentials, in ADR 0004's order: the stored record wins, the
+/// build-time `SNIFFER_WIFI_*` is the default under it. `None` for the SSID
+/// means there are no credentials at all and the radio stays off.
+async fn station_credentials() -> (Option<&'static str>, &'static str) {
+    let (ssid, password) = match settings::stored_wifi().await {
+        Some(wifi) => {
+            let wifi = &*STORED_WIFI.init(wifi);
+            (Some(wifi.ssid()), wifi.pass())
+        }
+        None => (WIFI_SSID, WIFI_PASS.unwrap_or("")),
+    };
+    STATION_SSID.lock(|cell| cell.set(ssid.unwrap_or("")));
+    (ssid, password)
+}
+
+/// The hostname in force. Resolved once, before the radio starts, so the
+/// `hostname` command can report it without re-reading flash - and so that
+/// what it reports is what DHCP was actually asked for.
+static HOSTNAME: BlockingMutex<CriticalSectionRawMutex, core::cell::Cell<&'static str>> =
+    BlockingMutex::new(core::cell::Cell::new(""));
+
+/// The name the DHCP client asked for. Empty before the radio starts.
+#[must_use]
+pub fn current_hostname() -> &'static str {
+    HOSTNAME.lock(core::cell::Cell::get)
+}
+
+/// The name this device asks DHCP for: the stored device record, else
+/// [`BUILD_HOSTNAME`], else `wfi028t-XXXX` from the MAC. Also remembers it
+/// for [`current_hostname`].
+async fn hostname() -> &'static str {
+    let name = resolve_hostname().await;
+    HOSTNAME.lock(|cell| cell.set(name));
+    name
+}
+
+async fn resolve_hostname() -> &'static str {
+    if let Some(device) = settings::stored_device().await {
+        return STORED_DEVICE.init(device).hostname();
+    }
+    match BUILD_HOSTNAME {
+        // A build-time name is not checked by a decoder, so it is checked
+        // here: a name a DHCP server would refuse is a typo in
+        // `.cargo/config.toml`, and silently asking for it would be worse
+        // than saying so and falling back.
+        Some(name) => match provision::records::check_hostname(name) {
+            Ok(()) => name,
+            Err(reason) => {
+                let mut line = Line::new();
+                let _ = core::fmt::Write::write_fmt(
+                    &mut line,
+                    format_args!(
+                        "# hostname from the build rejected ({reason}), using the MAC default\r\n"
+                    ),
+                );
+                publish_text(&line);
+                mac_hostname()
+            }
+        },
+        None => mac_hostname(),
+    }
+}
+
+/// `wfi028t-XXXX` from the last two bytes of the station MAC: the name of a
+/// unit nobody has named yet, unique enough that two fresh controllers on one
+/// network do not collide.
+fn mac_hostname() -> &'static str {
+    let mac = esp_hal::efuse::interface_mac_address(esp_hal::efuse::InterfaceMacAddress::Station);
+    let mac = mac.as_bytes();
+    let mut name = heapless::String::new();
+    // 12 characters into a 32-byte string: neither write can fail.
+    let _ = core::fmt::Write::write_fmt(
+        &mut name,
+        format_args!("wfi028t-{:02x}{:02x}", mac[4], mac[5]),
+    );
+    MAC_HOSTNAME.init(name).as_str()
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -440,10 +559,15 @@ async fn main(spawner: Spawner) {
         let _ = select(poll::EXCHANGED.wait(), Timer::after(Duration::from_secs(1))).await;
     }
 
-    let wifi_available = match WIFI_SSID {
-        Some(ssid) => net::start(&spawner, peripherals.WIFI, ssid, WIFI_PASS.unwrap_or("")),
+    // Identity last, with the radio: a stored record wins over the build-time
+    // default for both the credentials and the name (ADR 0004, component 1).
+    let (ssid, password) = station_credentials().await;
+    let hostname = hostname().await;
+
+    let wifi_available = match ssid {
+        Some(ssid) => net::start(&spawner, peripherals.WIFI, ssid, password, hostname),
         None => {
-            publish_text("# wifi disabled (no SNIFFER_WIFI_SSID at build time)\r\n");
+            publish_text("# wifi disabled (no stored network and no SNIFFER_WIFI_SSID)\r\n");
             false
         }
     };

@@ -20,6 +20,16 @@
 //! | `mqtt host <ip> [port]` | point at a broker (persisted, overrides the build-time one) |
 //! | `mqtt user <u> <p>` | broker credentials (persisted, never echoed back) |
 //! | `mqtt off` | no MQTT, even if the image was built with a broker |
+//! | `wifi` | report the station credentials in force, never the password |
+//! | `wifi set <ssid> <password>` | store credentials (quote a field with spaces) |
+//! | `wifi clear` | drop the stored credentials, back to the build-time ones |
+//! | `hostname` | report the name DHCP was asked for |
+//! | `hostname <name>` | store a hostname |
+//! | `hostname default` | drop the device record, back to the build-time name |
+//!
+//! `wifi` and `hostname` write the ADR 0004 records; the radio and the DHCP
+//! client read them once, at boot, so every one of those commands says that
+//! the change applies at the next reboot rather than pretending otherwise.
 //!
 //! `set` exists to drive the heat pump from a bench terminal before the MQTT
 //! task is written; it goes through the same [`master::COMMANDS`] queue and the
@@ -38,6 +48,7 @@ use embassy_time::{Duration, Instant, Timer};
 use hp_model::settings::Mode;
 use hp_model::Command as HpCommand;
 use modbus_sniffer_core as sniffer;
+use provision::records;
 use sniffer::{Command, Line};
 
 use crate::master::{self, CommandReport, OpMode};
@@ -146,6 +157,12 @@ pub async fn execute(text: &str) -> Line {
     if keyword.eq_ignore_ascii_case("mqtt") {
         return mqtt_command(rest).await;
     }
+    if keyword.eq_ignore_ascii_case("wifi") {
+        return wifi_command(rest).await;
+    }
+    if keyword.eq_ignore_ascii_case("hostname") {
+        return hostname_command(rest).await;
+    }
 
     let command = match sniffer::parse_command(text) {
         Ok(command) => command,
@@ -153,7 +170,9 @@ pub async fn execute(text: &str) -> Line {
             // The core parser's "unknown command" list does not know about the
             // two commands above; say the whole list.
             if reason.starts_with("unknown command") {
-                return reply_err("unknown command (bus, status, note, mode, set, mqtt)");
+                return reply_err(
+                    "unknown command (bus, status, note, mode, set, mqtt, wifi, hostname)",
+                );
             }
             return reply_err(reason);
         }
@@ -346,12 +365,21 @@ fn status_reply() -> Line {
     // running image's OTA verdict (`pending` while it is on probation), and
     // `console=` says whether somebody is attached to port 4001. `fw=` is the
     // build stamp from `build.rs`, the same text the hello line carries.
+    //
+    // `configured=` (ADR 0004) is appended after all of them, for the same
+    // reason: whether an admin password record exists, which is what decides
+    // whether setup mode opens.
     let _ = write!(
         reply,
-        " ota={} console={} fw={}",
+        " ota={} console={} fw={} configured={}",
         crate::ota::state_str(),
         crate::net::console_state(),
         env!("FW_VERSION"),
+        if crate::settings::configured() {
+            "yes"
+        } else {
+            "no"
+        },
     );
 
     if reply.push_str("\r\n").is_err() {
@@ -490,6 +518,170 @@ fn mqtt_report() -> Line {
         }
     }
     reply_ok(format_args!("{line}"))
+}
+
+// ---------------------------------------------------------------------------
+// wifi and hostname (ADR 0004)
+// ---------------------------------------------------------------------------
+
+/// `wifi [set <ssid> <password> | clear]`.
+///
+/// Unlike `mqtt`, this cannot take effect at once: the station is configured
+/// once, when the radio starts, so a change is a flash write plus a reboot.
+/// The reply says so. The password is never echoed, here or in `status`.
+async fn wifi_command(rest: &str) -> Line {
+    if rest.is_empty() {
+        return wifi_report().await;
+    }
+    let (word, args) = split_word(rest);
+
+    if word.eq_ignore_ascii_case("clear") && args.is_empty() {
+        if let Err(reason) = crate::settings::store_wifi(None).await {
+            return reply_err(reason);
+        }
+        return reply_ok(format_args!(
+            "wifi cleared; the build-time credentials apply at the next reboot"
+        ));
+    }
+
+    if word.eq_ignore_ascii_case("set") {
+        let (ssid, password) = match records::parse_wifi_set(args) {
+            Ok(fields) => fields,
+            Err(reason) => return reply_err(reason),
+        };
+        let wifi = match records::Wifi::new(ssid, password) {
+            Ok(wifi) => wifi,
+            Err(reason) => return reply_err(reason),
+        };
+        if let Err(reason) = crate::settings::store_wifi(Some(wifi)).await {
+            return reply_err(reason);
+        }
+        return reply_ok(format_args!(
+            "wifi ssid={ssid} stored; in force at the next reboot"
+        ));
+    }
+
+    reply_err(records::WIFI_USAGE)
+}
+
+/// The credentials that will be used, where they come from, and whether the
+/// radio is already using them. Never the password: `set` or `unset` is all a
+/// report needs to be useful.
+async fn wifi_report() -> Line {
+    let in_force = crate::current_ssid();
+    let stored = crate::settings::stored_wifi().await;
+    if let Some(wifi) = stored.as_ref() {
+        return reply_ok(format_args!(
+            "wifi ssid={} password={} source=stored{}",
+            wifi.ssid(),
+            if wifi.has_pass() { "set" } else { "unset" },
+            pending(wifi.ssid(), in_force)
+        ));
+    }
+    match crate::WIFI_SSID {
+        Some(ssid) => reply_ok(format_args!(
+            "wifi ssid={ssid} password={} source=build{}",
+            if crate::WIFI_PASS.unwrap_or("").is_empty() {
+                "unset"
+            } else {
+                "set"
+            },
+            pending(ssid, in_force)
+        )),
+        None => reply_ok(format_args!(
+            "wifi ssid=- password=unset source=none{}",
+            pending("", in_force)
+        )),
+    }
+}
+
+/// The note a report needs when flash and the radio disagree, which is what
+/// a `wifi set` or `wifi clear` in this session leaves behind.
+fn pending(ssid: &str, in_force: &str) -> &'static str {
+    if ssid == in_force {
+        ""
+    } else {
+        " (at the next reboot)"
+    }
+}
+
+/// `hostname [<name> | default]`.
+///
+/// `default` drops the whole device record - the hostname, the line-port
+/// policy and the setup-complete flag - because the hostname is a required
+/// field of that record and there is no "unset" for it. The reply says that
+/// too.
+async fn hostname_command(rest: &str) -> Line {
+    const USAGE: &str = "usage: hostname [<name>|default]";
+
+    if rest.is_empty() {
+        return hostname_report().await;
+    }
+    if rest.contains([' ', '\t']) {
+        return reply_err(USAGE);
+    }
+
+    if rest.eq_ignore_ascii_case("default") {
+        if let Err(reason) = crate::settings::store_device(None).await {
+            return reply_err(reason);
+        }
+        return reply_ok(format_args!(
+            "device record cleared (hostname, line ports, setup flag); \
+             the build-time hostname applies at the next reboot"
+        ));
+    }
+
+    // Keep whatever else the record holds, so renaming a device does not
+    // silently reset its line-port policy.
+    let next = match crate::settings::stored_device().await {
+        Some(device) => device.with_hostname(rest),
+        None => records::Device::new(rest, records::LinePolicy::Full, false),
+    };
+    let device = match next {
+        Ok(device) => device,
+        Err(reason) => return reply_err(reason),
+    };
+    if let Err(reason) = crate::settings::store_device(Some(device)).await {
+        return reply_err(reason);
+    }
+    reply_ok(format_args!(
+        "hostname {} stored; in force at the next reboot",
+        device.hostname()
+    ))
+}
+
+/// The name DHCP was asked for, where it came from, and the stored name if a
+/// command has since changed it.
+async fn hostname_report() -> Line {
+    let in_force = crate::current_hostname();
+    let stored = crate::settings::stored_device().await;
+    let source = if stored.is_some() {
+        "stored"
+    } else if crate::BUILD_HOSTNAME == Some(in_force) {
+        "build"
+    } else {
+        "mac"
+    };
+    match stored {
+        Some(device) if device.hostname() != in_force => reply_ok(format_args!(
+            "hostname {in_force} source={source} stored={} (at the next reboot)",
+            device.hostname()
+        )),
+        _ => reply_ok(format_args!(
+            "hostname {in_force} source={source} line_ports={}",
+            stored
+                .map_or(records::LinePolicy::Full, |d| d.ports())
+                .as_str()
+        )),
+    }
+}
+
+/// Split off the first whitespace-separated word, like the `mqtt` parser's.
+fn split_word(text: &str) -> (&str, &str) {
+    match text.find([' ', '\t']) {
+        Some(i) => (&text[..i], text[i + 1..].trim_matches([' ', '\t'])),
+        None => (text, ""),
+    }
 }
 
 // ---------------------------------------------------------------------------
