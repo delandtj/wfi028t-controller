@@ -27,9 +27,12 @@ pub const LEASE_MQTT_MS: u64 = 180_000;
 /// Lease of a request from the console: a person, not a loop.
 pub const LEASE_CONSOLE_MS: u64 = 600_000;
 /// Smallest change of 0x0043 worth a block write.
-pub const MIN_STEP_HZ: u8 = 2;
-/// Shortest time between two writes of 0x0043.
-pub const MIN_WRITE_INTERVAL_MS: u64 = 60_000;
+pub const MIN_STEP_HZ: u8 = 3;
+/// Shortest time between two writes of 0x0043. With HA's loop at 30 s this
+/// caps a full sunny day at ~200 frequency writes (each sent once, see
+/// [`crate::Settings::write_repeats`]); at 60 s and three repeats the first
+/// day of Managed made ~120 block writes an hour.
+pub const MIN_WRITE_INTERVAL_MS: u64 = 180_000;
 /// After queueing a command, wait this long for its readback before
 /// queueing another. A write takes about 3.5 s including the readback.
 pub const SETTLE_MS: u64 = 8_000;

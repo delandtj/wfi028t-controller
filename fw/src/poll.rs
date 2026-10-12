@@ -19,7 +19,8 @@
 //! rest is spent listening - which is how a second master gets noticed.
 //!
 //! **Writes sit between the polls, they do not replace them.** A settings
-//! change is three whole-block writes 500 ms apart; each one goes out in the
+//! change is three whole-block writes 500 ms apart (one for a bare manual
+//! frequency change, ADR 0007); each one goes out in the
 //! idle part of a slot, right after that slot's read has been answered:
 //!
 //! | Slot | Request | Write |
@@ -86,7 +87,8 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Consecutive request timeouts before the link counts as down.
 const LINK_DOWN_AFTER: u32 = 3;
 
-/// Whole-block writes per command, like the stock controller.
+/// Whole-block writes per command, like the stock controller. A bare manual
+/// frequency change goes once ([`Settings::write_repeats`]).
 const WRITE_REPEATS: u8 = 3;
 
 /// Listen-mode slice: how often the mode request, the bus setting and the
@@ -548,7 +550,8 @@ fn is_foreign_request(frame: &[u8]) -> bool {
 // Master mode: writes
 // ---------------------------------------------------------------------------
 
-/// The three-times whole-block write for one command.
+/// The whole-block write for one command: three times, or once for a bare
+/// frequency change.
 #[derive(Debug, Clone, Copy)]
 struct Write {
     command: Command,
@@ -560,7 +563,9 @@ struct Write {
     sent: u8,
     /// Acks received so far.
     acked: u8,
-    /// All three are out; the next settings read decides the outcome.
+    /// Writes to send: [`WRITE_REPEATS`], or 1 for a bare frequency change.
+    repeats: u8,
+    /// All writes are out; the next settings read decides the outcome.
     verifying: bool,
     /// One write per slot: set when this slot's write has gone out.
     sent_this_slot: bool,
@@ -621,7 +626,7 @@ async fn write_step(bus: &mut BusUart, st: &mut State, fresh_settings: bool) -> 
         let Some(write) = st.write.as_mut() else {
             return Answer::Ok;
         };
-        if write.verifying || write.sent >= WRITE_REPEATS || write.sent_this_slot {
+        if write.verifying || write.sent >= write.repeats || write.sent_this_slot {
             return Answer::Ok;
         }
         write.sent += 1;
@@ -643,9 +648,9 @@ async fn write_step(bus: &mut BusUart, st: &mut State, fresh_settings: bool) -> 
         Answer::Foreign => return Answer::Foreign,
     }
 
-    // Third write out: the next settings poll is the verdict.
+    // Last write out: the next settings poll is the verdict.
     if let Some(write) = st.write.as_mut() {
-        if write.sent >= WRITE_REPEATS {
+        if write.sent >= write.repeats {
             write.verifying = true;
             if write.acked == 0 {
                 let report = CommandReport {
@@ -680,8 +685,9 @@ fn start_write(st: &mut State, fresh: Settings) {
         Ok(wanted) => {
             let mut line = Line::new();
             let _ = write_command(&mut line, &command);
+            let repeats = fresh.write_repeats(&wanted).min(WRITE_REPEATS);
             crate::publish_note(format_args!(
-                "write {line}: {} registers, {WRITE_REPEATS} times, settings age {age} ms",
+                "write {line}: {} registers, {repeats} times, settings age {age} ms",
                 fresh.diff(&wanted).count()
             ));
             st.write = Some(Write {
@@ -690,6 +696,7 @@ fn start_write(st: &mut State, fresh: Settings) {
                 wanted,
                 sent: 0,
                 acked: 0,
+                repeats,
                 verifying: false,
                 sent_this_slot: false,
                 verify_misses: 0,

@@ -377,6 +377,21 @@ impl Settings {
         }
     }
 
+    /// How many times to send the whole-block write that turns this block
+    /// into `wanted`: three, like the stock controller, except for a change
+    /// of the manual frequency value (0x0043) alone, which goes once. Those
+    /// come from a control loop many times an hour, and the block probably
+    /// lives in EEPROM (ADR 0007); a lost one is re-sent by the manager when
+    /// the readback does not show it.
+    #[must_use]
+    pub fn write_repeats(&self, wanted: &Self) -> u8 {
+        let mut changed = self.diff(wanted).map(|(addr, _, _)| addr);
+        match (changed.next(), changed.next()) {
+            (Some(REG_MANUAL_FREQ), None) => 1,
+            _ => 3,
+        }
+    }
+
     /// Registers that differ from `other`, as `(address, mine, theirs)`. For
     /// logging a write or a surprising readback.
     pub fn diff<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = (u16, u16, u16)> + 'a {
@@ -489,6 +504,22 @@ mod tests {
 
         assert!(snap().apply(Command::SetManualFreq(Some(29))).is_err());
         assert!(snap().apply(Command::SetManualFreq(Some(91))).is_err());
+    }
+
+    #[test]
+    fn only_a_bare_frequency_change_is_written_once() {
+        let off = snap();
+        let on = off.apply(Command::SetManualFreq(Some(45))).unwrap();
+        let moved = on.apply(Command::SetManualFreq(Some(40))).unwrap();
+        // Bit and value together: the usual three.
+        assert_eq!(off.write_repeats(&on), 3);
+        // Value alone, bit already set: once.
+        assert_eq!(on.write_repeats(&moved), 1);
+        // Clearing the bit, and everything else: three.
+        let cleared = moved.apply(Command::SetManualFreq(None)).unwrap();
+        assert_eq!(moved.write_repeats(&cleared), 3);
+        let p01 = off.apply(Command::SetHeatSetpoint(34)).unwrap();
+        assert_eq!(off.write_repeats(&p01), 3);
     }
 
     #[test]

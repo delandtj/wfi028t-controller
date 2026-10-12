@@ -4,7 +4,10 @@
 **Date**: 2026-10-12
 **Updated**: 2026-10-12 (implemented; deviations folded in: one
 `SetManualFreq(Option<u8>)` command instead of `apply_all`, the lease
-sensor rides with the counters, console syntax `set mfreq <hz>|off`)
+sensor rides with the counters, console syntax `set mfreq <hz>|off`.
+After the first hour of HA's Managed mode - ~40 frequency changes, ~120
+block writes - the rate limit went to 3 Hz / 3 min and a bare frequency
+change is written once instead of three times)
 
 ---
 
@@ -111,17 +114,22 @@ frequency; the firmware decides whether and when that reaches the bus.
      | Fault | any of 0x0007-0x000d nonzero (includes the water flow fault, 0x0008 bit 0), or 0x001c/0x001d nonzero | clear bit 1, reason `fault` |
      | Cut-out | inlet water >= active setpoint | clear bit 1, latch, reason `setpoint` |
      | Latch | latched and inlet > setpoint - P04 | refuse `on`, reason `setpoint` |
-     | Rate | hz change < 2 Hz, or < 60 s since the last 0x0043 write | hold; write the latest value when allowed |
+     | Rate | hz change < 3 Hz, or < 180 s since the last 0x0043 write | hold; write the latest value when allowed |
 
      Enabling writes 0x0043 and bit 1 together in one block write, so the
      mainboard never runs in manual mode with a stale 0x0043. Disabling is
      immediate and does not wait for the rate limit. After queueing any
      command the manager waits 8 s (`SETTLE_MS`) for the readback before it
      queues another, so a slow write is never queued twice.
-   - The rate limit applies to 0x0043 only. Worst case with a busy HA loop:
-     one block write per minute while running, i.e. under 1000 per day of
-     full-time running. The values (2 Hz, 60 s, 180 s lease) are constants
-     first; settings only if they turn out to need tuning in the field.
+   - The rate limit applies to 0x0043 only. A change of 0x0043 alone (bit 1
+     already set) is sent ONCE, not three times
+     (`Settings::write_repeats`); if it is lost, the readback does not show
+     it and the manager queues it again after its settle time. Enabling,
+     disabling and every other command keep the stock controller's three.
+     Worst case with a busy HA loop: one block write per 3 min while
+     running, about 200 on a 10 h day. The values (3 Hz, 180 s, 180 s
+     lease) are constants first; settings only if they turn out to need
+     tuning in the field.
 
 3. **Master** ([`fw/src/master.rs`](../../fw/src/master.rs))
    - Power-off from any source (MQTT, console, HA) is applied together with
@@ -285,7 +293,8 @@ request always wins.
 
 **Q: What about EEPROM wear from the lease resends?**
 A: None: a resend that does not change the held value is a firmware-only
-event. Only a change of at least 2 Hz, at most once a minute, or an on/off
+event. Only a change of at least 3 Hz, at most once per 3 min (sent once),
+or an on/off
 transition, causes a block write.
 
 ---
@@ -299,7 +308,8 @@ transition, causes a block write.
   - Cost to change later: small (entity ids are new), but HA automations
     would need editing. One entity means one message carries both "on" and
     the value, so the two can never disagree.
-- **Lease 180 s, rate limit 60 s / 2 Hz** as constants.
+- **Lease 180 s, rate limit 180 s / 3 Hz** as constants (first set at
+  60 s / 2 Hz; tightened after the first hour of Managed).
   - Alternative: settings over the console/MQTT.
   - Cost to change later: a firmware update; promote to settings only if
     field use asks for it.
@@ -329,7 +339,7 @@ transition, causes a block write.
 ### Review asks
 
 1. One `number` with an `off` payload, or a switch plus a number?
-2. Lease 180 s, rate limit 60 s / 2 Hz: OK as starting constants?
+2. Lease 180 s, rate limit 180 s / 3 Hz: OK as starting constants?
 3. Keep the setpoint cut-out in the firmware even though HA also stops at
    the setpoint (yes / no)?
 4. Clear manual mode on `mode listen`, so the stock controller never
