@@ -1591,6 +1591,9 @@ dependencies = [
 [[package]]
 name = "provision"
 version = "0.1.0"
+dependencies = [
+ "hp-model",
+]
 
 [[package]]
 name = "quote"

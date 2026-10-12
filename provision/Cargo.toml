@@ -5,3 +5,4 @@ edition = "2021"
 description = "Provisioning records and setup-mode responders (ADR 0004)"
 
 [dependencies]
+hp-model = { version = "0.1.0", path = "../hp-model" }

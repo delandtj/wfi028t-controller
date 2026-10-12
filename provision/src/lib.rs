@@ -12,4 +12,6 @@
 
 pub mod dhcp;
 pub mod dns;
+pub mod layout;
 pub mod mdns;
+pub mod records;
