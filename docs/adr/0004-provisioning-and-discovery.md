@@ -1,9 +1,13 @@
 # First run: setup access point, stored WiFi, heat pump discovery
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-10-04
 **Updated**: 2026-10-06 (vendor protocol: the slave address is 1-16 by DIP
 switch, and writes get no exception response; discovery adapts)
+**Updated**: 2026-10-12 (review asks settled: all four defaults accepted; a
+build with compiled-in WiFi gets no "configured by build" exception; the
+parts that need no web server are built first, the pages follow ADR 0003's
+server)
 
 ---
 
@@ -466,15 +470,21 @@ the upgrade path, and it is tested on the bench board before the live unit.
 - Pages and endpoints on ADR 0003's server.
 - README "first run"; ADR 0001/0002 cross references.
 
-Review asks:
+Review asks (settled 2026-10-12, all yes):
 
 1. Open setup AP, only while unconfigured or after a button reset, 30-minute
-   window - yes, or WPA2 with a MAC-derived password?
-2. Factory reset keeps the bus record - yes/no?
+   window: yes.
+2. Factory reset keeps the bus record: yes.
 3. Hostname default `wfi028t-XXXX` for new devices (the live unit keeps
-   `wfi-controller` explicitly) - yes/no?
-4. Released builds default the line ports to read-only - yes/no? (Same as ADR
-   0003 review ask 3.)
+   `wfi-controller` explicitly): yes.
+4. Released builds default the line ports to read-only: yes.
+
+Build order: everything that needs no web server first - the AP+STA bench
+test, the settings records, the DHCP/DNS/mDNS responders, discovery (driven
+from the console until the pages exist), the button and the LED states. The
+pages and endpoints follow once ADR 0003's server, guard and sessions exist.
+Radio work is tested on a bench C6 with the mock heat pump before the live
+unit gets it.
 
 ---
 
@@ -483,8 +493,11 @@ Review asks:
 **Architecture-changers**
 - [ ] AP+STA at once, or AP-only setup with a reboot to test the network?
       Decided by a bench test of esp-radio's AP+STA before the WiFi page.
-- [ ] Does the upgrade path for the live unit (OTA into an image with setup
+- [x] Does the upgrade path for the live unit (OTA into an image with setup
       mode) need a "configured by build" flag, so it never shows an open AP?
+      No (2026-10-12): it behaves as the Expert section says - the AP opens,
+      polling and the build-time station credentials carry on, and the first
+      visit to the setup page sets the password.
 
 **Behavior definers**
 - [ ] Discovery: should it also offer to read the heat pump's settings into a
