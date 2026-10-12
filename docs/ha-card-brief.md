@@ -175,6 +175,7 @@ should set its own short labels.
 | `number.wfi028t_p02` | Cooling setpoint | **8..28**, step 1 | Used in `cool` |
 | `number.wfi028t_p03` | Auto setpoint | 8..40, step 1 | Used in `auto` |
 | `number.wfi028t_p04` | Restart hysteresis | 1..18, step 1 | A delta, though it carries the degC unit. Secondary control |
+| `number.wfi028t_manual_hz` | Manual frequency | 30..90 Hz, step 1, or payload `off` | ADR 0007. Not a plain setting: a request with a 180 s lease, to be resent by an automation (HA ADR 0002). State is the held Hz while manual mode is on, `null` (unknown) when off. Accepted requests are not echoed in `last_command`; refusals are |
 
 Setpoints are whole degrees.
 
@@ -213,6 +214,9 @@ Values can be negative. A sensor that is not fitted reads `unknown`
 | `binary_sensor.wfi028t_water_flow_fault` | Water flow fault | problem | 0x0008 bit 0 (vendor: water flow switch fault). Self-clears |
 | `binary_sensor.wfi028t_compressor_running` | Compressor running | running | Derived: compressor_hz > 0 |
 | `binary_sensor.wfi028t_water_pump` | Water pump | - | Circulating pump, 0x0006 bit 2. Runs on ~45 s after a compressor stop |
+| `binary_sensor.wfi028t_manual_freq` | Manual frequency active | - | 0x003f bit 1 as read back (ADR 0007) |
+| `sensor.wfi028t_manual_reason` | Manual frequency reason | - | `-` running or switched off on request; `lease`, `boot`, `power`, `mode`, `fault`, `setpoint`: why the firmware ended or refused it |
+| `sensor.wfi028t_manual_lease_s` | Manual frequency lease | s | Diagnostic; seconds left on the lease |
 | `binary_sensor.wfi028t_heating_active` | Compressor output | - | Compressor run command, 0x0004 bit 0; leads compressor_running by ~10 s. Id kept from the old name |
 | `binary_sensor.wfi028t_run_permitted` | Heating demand | - | 0x0005 bit 7; off at thermostat stops and power-off. Id kept from the old name |
 | `binary_sensor.wfi028t_boost_active` | Boost active | - | Heat pump's confirmation of the boost request; may lag the switch |

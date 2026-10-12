@@ -15,8 +15,7 @@
 //! | `set p05 on\|off` | stop once the target is reached |
 //! | `set mode heat\|cool\|auto` | operating mode of the heat pump |
 //! | `set p01..p04 <n>` | setpoints and hysteresis, whole degrees |
-//! | `set mfreq_hz <hz>` | manual compressor frequency, 30-90 (0x0043) |
-//! | `set mfreq on\|off` | manual compressor frequency mode (0x003f bit 1) |
+//! | `set mfreq <hz>\|off` | manual compressor frequency, 30-90 Hz, 10 min lease (ADR 0007) |
 //! | `mqtt` | report the broker configuration and connection state |
 //! | `mqtt host <ip> [port]` | point at a broker (persisted, overrides the build-time one) |
 //! | `mqtt user <u> <p>` | broker credentials (persisted, never echoed back) |
@@ -296,6 +295,13 @@ fn status_reply() -> Line {
                 u8::from(status.water_flow_fault()),
             );
         }
+        let manual = crate::manual::view();
+        let _ = write!(
+            reply,
+            " manual_reason={} manual_lease_s={}",
+            manual.reason.as_str(),
+            manual.lease_s,
+        );
         let _ = write!(
             reply,
             " status_age_ms={} snapshot_age_ms={}",
@@ -366,6 +372,15 @@ async fn mode_command(rest: &str) -> Line {
         return reply_err("usage: mode [listen|master]");
     };
 
+    // Nobody would end a manual frequency after this (ADR 0007), and the
+    // stock controller, if it comes back, may not either: clear it first.
+    let mut cleared = None;
+    if wanted == OpMode::Listen && master::mode() == OpMode::Master {
+        if let Some(command) = crate::manual::release_for_listen() {
+            cleared = Some(submit_and_wait(command, "mode listen: first").await);
+        }
+    }
+
     match master::request_mode(wanted).await {
         Ok(now) => {
             // Remember the operator's intent. An automatic fallback to listen
@@ -374,7 +389,14 @@ async fn mode_command(rest: &str) -> Line {
             if let Err(reason) = crate::settings::store_mode(now).await {
                 return reply_err(reason);
             }
-            reply_ok(format_args!("mode {}", now.as_str()))
+            match cleared {
+                Some(first) => reply_ok(format_args!(
+                    "mode {} ({})",
+                    now.as_str(),
+                    first.trim_start_matches("# ok ").trim_end()
+                )),
+                None => reply_ok(format_args!("mode {}", now.as_str())),
+            }
         }
         Err(reason) => reply_err(reason),
     }
@@ -481,6 +503,10 @@ async fn set_command(rest: &str) -> Line {
         None => (rest, ""),
     };
 
+    if field.eq_ignore_ascii_case("mfreq") {
+        return mfreq_command(value);
+    }
+
     let command = match parse_set(field, value) {
         Ok(command) => command,
         Err(usage) => return reply_err(usage),
@@ -498,6 +524,12 @@ async fn set_command(rest: &str) -> Line {
         return reply_err("rebooting into a new image; re-issue this after the reboot");
     }
 
+    submit_and_wait(command, "set").await
+}
+
+/// Queue `command` and wait for its outcome, up to [`OUTCOME_WAIT`]. `verb`
+/// starts the reply (`set ...`, `mode listen: ...`).
+async fn submit_and_wait(command: HpCommand, verb: &str) -> Line {
     // Subscribe before queueing, and mark whatever is already there as seen,
     // so the reply cannot be a previous command's outcome.
     let mut receiver = master::OUTCOMES.receiver();
@@ -510,7 +542,7 @@ async fn set_command(rest: &str) -> Line {
     }
 
     let Some(receiver) = receiver.as_mut() else {
-        return reply_ok(format_args!("set queued (no outcome slot free)"));
+        return reply_ok(format_args!("{verb} queued (no outcome slot free)"));
     };
 
     let wait = async {
@@ -528,21 +560,50 @@ async fn set_command(rest: &str) -> Line {
             if master::write_report(&mut line, &report).is_err() {
                 return reply_err("reply too long");
             }
-            reply_ok(format_args!("set {line}"))
+            reply_ok(format_args!("{verb} {line}"))
         }
         Either::Second(()) => {
             if master::write_command(&mut line, &command).is_err() {
                 return reply_err("reply too long");
             }
-            reply_ok(format_args!("set {line} -> queued (outcome follows)"))
+            reply_ok(format_args!("{verb} {line} -> queued (outcome follows)"))
         }
+    }
+}
+
+/// `set mfreq <hz>|off`: a request to the manual-frequency manager, not a
+/// command. The manager decides whether and when it reaches the bus, so the
+/// reply says what was asked and what stands in the way, if anything.
+fn mfreq_command(value: &str) -> Line {
+    const USAGE: &str = "usage: set mfreq <30-90>|off";
+    let hz = if value.eq_ignore_ascii_case("off") {
+        None
+    } else {
+        match value.parse::<u8>() {
+            Ok(hz) => Some(hz),
+            Err(_) => return reply_err(USAGE),
+        }
+    };
+    if master::mode() != OpMode::Master {
+        return reply_err("not in master mode (try: mode master)");
+    }
+    if let Err(reason) = crate::manual::request(hz, hp_model::manual::LEASE_CONSOLE_MS) {
+        return reply_err(reason);
+    }
+    let view = crate::manual::view();
+    match hz {
+        Some(hz) => reply_ok(format_args!(
+            "mfreq {hz} requested, lease {} s, reason {} (status shows hp_mfreq when it is applied)",
+            view.lease_s,
+            view.reason.as_str()
+        )),
+        None => reply_ok(format_args!("mfreq off requested")),
     }
 }
 
 fn parse_set(field: &str, value: &str) -> Result<HpCommand, &'static str> {
     const USAGE: &str = "usage: set power|boost|p05 on|off, set mode heat|cool|auto, \
-                         set p01|p02|p03|p04 <degrees>, set mfreq on|off, \
-                         set mfreq_hz <hz>";
+                         set p01|p02|p03|p04 <degrees>, set mfreq <hz>|off";
 
     let as_bool = || match value {
         v if v.eq_ignore_ascii_case("on") || v == "1" || v.eq_ignore_ascii_case("true") => {
@@ -575,13 +636,6 @@ fn parse_set(field: &str, value: &str) -> Result<HpCommand, &'static str> {
             return Err(USAGE);
         };
         return Ok(HpCommand::SetMode(mode));
-    }
-    // Vendor-protocol manual frequency, for the bench test only: not on MQTT.
-    if field.eq_ignore_ascii_case("mfreq") {
-        return as_bool().map(HpCommand::SetManualFreq).ok_or(USAGE);
-    }
-    if field.eq_ignore_ascii_case("mfreq_hz") {
-        return as_u8().map(HpCommand::SetManualFreqHz).ok_or(USAGE);
     }
     if field.eq_ignore_ascii_case("p01") {
         return as_u8().map(HpCommand::SetHeatSetpoint).ok_or(USAGE);

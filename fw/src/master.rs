@@ -219,7 +219,8 @@ pub struct CommandReport {
 /// one of each at boot and keeps them; the line interface takes a short-lived
 /// one per `set` command (one per transport at worst, and there are three of
 /// those since ADR 0002 added the console); the OTA probation task takes one
-/// for its first two minutes; the rest is headroom.
+/// for its first two minutes; the manual-frequency manager holds a
+/// [`SNAPSHOT`] one for good (ADR 0007); the rest is headroom.
 const SUBSCRIBERS: usize = 8;
 
 /// Latest decoded state. Subscribe with `SNAPSHOT.receiver()`.
@@ -324,8 +325,8 @@ pub fn write_command(out: &mut Line, command: &Command) -> core::fmt::Result {
         Command::SetCoolSetpoint(v) => write!(out, "p02 {v}"),
         Command::SetAutoSetpoint(v) => write!(out, "p03 {v}"),
         Command::SetHysteresis(v) => write!(out, "p04 {v}"),
-        Command::SetManualFreq(on) => write!(out, "mfreq {}", on_off(*on)),
-        Command::SetManualFreqHz(v) => write!(out, "mfreq_hz {v}"),
+        Command::SetManualFreq(Some(v)) => write!(out, "mfreq {v}"),
+        Command::SetManualFreq(None) => write!(out, "mfreq off"),
     }
 }
 

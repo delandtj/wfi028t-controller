@@ -23,7 +23,7 @@
 //! #[path = ".../fw/src/mqtt/config.rs"] pub mod config;
 //! ```
 //!
-//! `cargo test` in that harness runs them unchanged (21 tests). Nothing in
+//! `cargo test` in that harness runs them unchanged (23 tests). Nothing in
 //! these three modules may therefore refer to `crate::` or to anything
 //! hardware-bound - which is also what keeps them reviewable on their own.
 
@@ -63,6 +63,12 @@ pub struct View<'a> {
     pub last_command: &'a str,
     /// Bus counters since boot.
     pub counters: Counters,
+    /// Why manual frequency is not running (`-` when it is or was switched
+    /// off on request), from the firmware's manager.
+    pub manual_reason: &'static str,
+    /// Seconds left on the manual-frequency lease. Counts down every second,
+    /// so it sits with the counters.
+    pub manual_lease_s: u32,
 }
 
 /// First key of the counter block, which is also where the document stops
@@ -115,6 +121,11 @@ pub fn write_state(out: &mut dyn Write, view: &View<'_>) -> core::fmt::Result {
             doc.number("p02", Some(settings.cool_setpoint()))?;
             doc.number("p03", Some(settings.auto_setpoint()))?;
             doc.number("p04", Some(settings.hysteresis()))?;
+            doc.number(
+                "manual_hz",
+                settings.manual_freq().then(|| settings.manual_freq_hz()),
+            )?;
+            doc.flag("manual_freq", settings.manual_freq())?;
         }
         None => doc.all_null(&[
             "power",
@@ -125,6 +136,8 @@ pub fn write_state(out: &mut dyn Write, view: &View<'_>) -> core::fmt::Result {
             "p02",
             "p03",
             "p04",
+            "manual_hz",
+            "manual_freq",
         ])?,
     }
 
@@ -185,11 +198,14 @@ pub fn write_state(out: &mut dyn Write, view: &View<'_>) -> core::fmt::Result {
     write!(doc.out, "\"{}\"", view.controller_mode)?;
     doc.key("last_command")?;
     doc.string(view.last_command)?;
+    doc.key("manual_reason")?;
+    doc.string(view.manual_reason)?;
     // The counters come last, and [`COUNTERS_AT`] says so.
     doc.number("requests", Some(view.counters.requests))?;
     doc.number("timeouts", Some(view.counters.timeouts))?;
     doc.number("writes", Some(view.counters.writes))?;
     doc.number("write_failures", Some(view.counters.write_failures))?;
+    doc.number("manual_lease_s", Some(view.manual_lease_s))?;
 
     doc.finish()
 }
@@ -319,6 +335,8 @@ mod tests {
                 writes: 3,
                 write_failures: 1,
             },
+            manual_reason: "-",
+            manual_lease_s: 0,
         })
     }
 
@@ -414,6 +432,8 @@ mod tests {
             controller_mode: "listen",
             last_command: "",
             counters: Counters::default(),
+            manual_reason: "-",
+            manual_lease_s: 0,
         });
         assert!(doc.contains("\"inlet_water\":null"));
         assert!(doc.contains("\"outlet_water\":null"));
@@ -444,8 +464,10 @@ mod tests {
             controller_mode: "listen",
             last_command: "",
             counters: Counters::default(),
+            manual_reason: "-",
+            manual_lease_s: 0,
         });
-        assert_eq!(doc.matches(":null").count(), 29);
+        assert_eq!(doc.matches(":null").count(), 31);
         assert_eq!(
             doc.matches("\":").count(),
             super::super::entity::ENTITIES.len()
@@ -466,6 +488,8 @@ mod tests {
             controller_mode: "master",
             last_command: "",
             counters: Counters::default(),
+            manual_reason: "-",
+            manual_lease_s: 0,
         });
         assert!(doc.contains("\"ambient\":-4.0"));
         assert!(doc.contains("\"inlet_water\":-2.5"));
@@ -481,6 +505,8 @@ mod tests {
             controller_mode: "listen",
             last_command: "say \"hi\"\\ now\n",
             counters: Counters::default(),
+            manual_reason: "-",
+            manual_lease_s: 0,
         });
         assert!(doc.contains(r#""last_command":"say \"hi\"\\ now\u000a""#));
         assert_eq!(doc.bytes().filter(|&b| b == b'\n').count(), 0);
@@ -498,6 +524,8 @@ mod tests {
             controller_mode: "master",
             last_command: "",
             counters,
+            manual_reason: "-",
+            manual_lease_s: 0,
         };
         let a = render(&view(Counters {
             requests: 10,
@@ -515,7 +543,7 @@ mod tests {
         assert_eq!(volatile_free(&a), volatile_free(&b));
         // The counters really are at the end, and the prefix is most of it.
         assert!(volatile_free(&a).len() > a.len() - 80);
-        assert!(volatile_free(&a).ends_with("\"last_command\":\"\""));
+        assert!(volatile_free(&a).ends_with("\"manual_reason\":\"-\""));
         // A real change does show up.
         let mut block = STATUS_BLOCK;
         block[0x0010] = 61;

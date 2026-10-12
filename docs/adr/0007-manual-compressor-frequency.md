@@ -1,7 +1,10 @@
 # Manual compressor frequency: an MQTT number with a lease
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-10-12
+**Updated**: 2026-10-12 (implemented; deviations folded in: one
+`SetManualFreq(Option<u8>)` command instead of `apply_all`, the lease
+sensor rides with the counters, console syntax `set mfreq <hz>|off`)
 
 ---
 
@@ -76,16 +79,19 @@ frequency; the firmware decides whether and when that reaches the bus.
 
 ### Component Breakdown
 
-1. **Model** ([`hp-model/src/settings.rs`](../../hp-model/src/settings.rs))
-   - Already has `BIT_MANUAL_FREQ`, `REG_MANUAL_FREQ`,
-     `Command::SetManualFreq(bool)`, `Command::SetManualFreqHz(u8)` with the
-     30-90 range, and `Settings::manual_freq()` / `manual_freq_hz()`.
-   - Adds `Command::ManualOff`-style composition only if needed: power-off
-     plus clearing bit 1 must be ONE block write (see 3), so `apply` gains a
-     way to apply two changes to one block (`apply_all(&[Command])`), still
-     touching nothing else.
+1. **Model** ([`hp-model/src/settings.rs`](../../hp-model/src/settings.rs),
+   [`hp-model/src/manual.rs`](../../hp-model/src/manual.rs))
+   - `BIT_MANUAL_FREQ`, `REG_MANUAL_FREQ`, `Settings::manual_freq()` /
+     `manual_freq_hz()`, and one command, `Command::SetManualFreq(Option<u8>)`:
+     `Some(hz)` writes 0x0043 and sets bit 1 in the same block (30-90 Hz),
+     `None` clears bit 1 and leaves 0x0043 alone.
+   - `Command::SetPower(false)` clears bit 1 in the same write. No
+     multi-command `apply` was needed.
+   - `Status::any_fault()`: 0x0007-0x000d or 0x001c/0x001d nonzero.
+   - `manual::Manual`: the rules below as a pure state machine with a
+     caller-supplied clock, tested on the host.
 
-2. **Manual-frequency manager** (new, `fw/src/manual.rs`)
+2. **Manual-frequency manager** ([`fw/src/manual.rs`](../../fw/src/manual.rs), around `hp_model::manual::Manual`)
    - Owns the requested state: `Off` or `On { hz, lease_until }`, and the
      cut-out latch.
    - Inputs: requests (MQTT, console), each status/settings poll (to see
@@ -109,7 +115,9 @@ frequency; the firmware decides whether and when that reaches the bus.
 
      Enabling writes 0x0043 and bit 1 together in one block write, so the
      mainboard never runs in manual mode with a stale 0x0043. Disabling is
-     immediate and does not wait for the rate limit.
+     immediate and does not wait for the rate limit. After queueing any
+     command the manager waits 8 s (`SETTLE_MS`) for the readback before it
+     queues another, so a slow write is never queued twice.
    - The rate limit applies to 0x0043 only. Worst case with a busy HA loop:
      one block write per minute while running, i.e. under 1000 per day of
      full-time running. The values (2 Hz, 60 s, 180 s lease) are constants
@@ -118,25 +126,33 @@ frequency; the firmware decides whether and when that reaches the bus.
 3. **Master** ([`fw/src/master.rs`](../../fw/src/master.rs))
    - Power-off from any source (MQTT, console, HA) is applied together with
      clearing bit 1, so the unit never comes back on in manual mode.
-   - `write_command` spells the new commands for the notes and
-     `last_command` (`manual_hz 42`, `manual off (lease)`).
+   - `write_command` spells the command for the notes and `last_command`
+     (`mfreq 42`, `mfreq off`); the reason is in its own note
+     (`manual frequency: reason - -> lease`).
 
 4. **MQTT** ([`fw/src/mqtt/entity.rs`](../../fw/src/mqtt/entity.rs))
    - Command topic `wfi028t/manual_hz/set`, payload `30`..`90` or `off`.
      Out-of-range numbers are rejected like the setpoints are.
    - Discovery: `number.wfi028t_manual_hz` (30-90, step 1, unit Hz, mode
-     box), `binary_sensor.wfi028t_manual_freq` (bit 1 as read back),
-     `sensor.wfi028t_manual_reason` (`-`, `lease`, `power`, `mode`, `fault`,
-     `setpoint`, `boot`: why the firmware last cleared or refused it),
-     `sensor.wfi028t_manual_lease` (seconds left, 0 when off).
-   - State document gains `manual_freq`, `manual_hz`, `manual_reason`,
-     `manual_lease_s`.
+     box; `Kind::Number` gained a unit), `binary_sensor.wfi028t_manual_freq`
+     (bit 1 as read back), `sensor.wfi028t_manual_reason` (`-`, `lease`,
+     `power`, `mode`, `fault`, `setpoint`, `boot`: why the firmware last
+     cleared or refused it), `sensor.wfi028t_manual_lease_s` (diagnostic,
+     seconds left, 0 when off).
+   - State document gains `manual_hz` (the held value while bit 1 is set,
+     `null` otherwise), `manual_freq`, `manual_reason`, and
+     `manual_lease_s`. The lease counts down every second, so it is written
+     after the counters, where changes do not trigger a publish.
+   - An accepted request is not logged or echoed in `last_command` (it
+     arrives every 30-60 s); a refused one is, like any refused command.
    - Not in the HA card by default; the HA side decides where it shows.
 
 5. **Console** ([`fw/src/cmd.rs`](../../fw/src/cmd.rs))
-   - `set mfreq on|off` and `set mfreq_hz <hz>` route to the manager instead
-     of straight into the command queue. A console request gets a 10 min
-     lease (it is a person at a terminal, not a loop).
+   - `set mfreq <hz>|off` is a request to the manager (the test's
+     `set mfreq on|off` / `set mfreq_hz` are gone). A console request gets a
+     10 min lease (it is a person at a terminal, not a loop).
+   - `mode listen` first clears bit 1 (and waits for the outcome) if the
+     heat pump holds it.
    - `status` keeps `hp_mfreq`, `hp_mfreq_hz`, `hp_target_hz` and gains
      `manual_reason=`, `manual_lease_s=`.
 
@@ -304,12 +320,11 @@ transition, causes a block write.
 
 ### The mechanical work
 
-- `Settings::apply_all`, the manager module, the master's power-off
-  coupling, MQTT command parsing and discovery, console routing, status
+- The model command and power-off coupling, the manager module, MQTT command parsing and discovery, console routing, status
   fields, register-map update.
-- Tests: model tests for `apply_all`; manager rule tests on the host
-  (pure state machine, fed snapshots and a clock); a bench run against
-  `hp_mock.py` with a lease expiry and a setpoint cut-out.
+- Tests: model tests for the command and power-off coupling; manager rule
+  tests on the host (pure state machine, fed snapshots and a clock); the
+  MQTT entity/json host tests; a live check on the unit.
 
 ### Review asks
 

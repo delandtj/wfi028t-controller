@@ -229,6 +229,17 @@ impl Status {
         self.bit(0x0008, 0)
     }
 
+    /// Any fault or protection flag: 0x0007-0x000d (the vendor's fault
+    /// flag words, water flow fault included) or the inverter module 1 fault
+    /// codes 0x001c/0x001d. All zero throughout the capture except during the
+    /// flow test. Ends manual frequency (ADR 0007).
+    #[must_use]
+    pub fn any_fault(&self) -> bool {
+        (0x0007..=0x000d)
+            .chain(0x001c..=0x001d)
+            .any(|addr| self.at(addr) != 0)
+    }
+
     /// High fan speed, 0x0004 bit 7. Mirrors boost (0x003f bit 6 clear) in
     /// every capture, so it doubles as the heat pump's confirmation of it.
     #[must_use]

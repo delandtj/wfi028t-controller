@@ -64,7 +64,8 @@ firmware is master (WFI's installation sheet says the same).
 
 ## Controls (settings block)
 
-0x003f is the main bit field: bit 0 on/off, bit 4 P05, bit 6 ECO/boost.
+0x003f is the main bit field: bit 0 on/off, bit 1 manual frequency, bit 4
+P05, bit 6 ECO/boost.
 Setpoints are whole degrees (unlike the sensors).
 
 | Control | Register | Values | HA entity | Evidence |
@@ -77,6 +78,7 @@ Setpoints are whole degrees (unlike the sensors).
 | P02 cooling setpoint | 0x0042 | 8-28 C | `number.wfi028t_p02` | capture 27->28->27 |
 | P03 auto setpoint | 0x004a | 8-40 C | `number.wfi028t_p03` | capture 27->28->27 |
 | P04 restart hysteresis | 0x004d | 1-18 C | `number.wfi028t_p04` | capture 1->2->1 |
+| Manual frequency | 0x003f bit 1 + 0x0043 | bit 1 = 1: the compressor runs at 0x0043 Hz (30-90) instead of the mainboard's choice | `number.wfi028t_manual_hz`, through the firmware's manager (ADR 0007) | test 2026-10-12: target followed 50 and 30 Hz within ~5 s, ramp 1-2 Hz/s; clearing bit 1 handed control back. Survives a power cut like every setting. Setpoint handling in manual mode untested |
 | Forced defrost | 0x003f bit 14 | - | not exposed | vendor only; never written. Candidate for a manual defrost button |
 
 ## Other settings
@@ -89,7 +91,7 @@ targeted, not safe.
 
 | Registers | Captured | Vendor name (range, default) |
 |---|---|---|
-| 0x0043 | 50 | manual frequency setting |
+| 0x0043 | 50 | manual frequency setting - now a control, see "Controls" |
 | 0x0044 | 150 | manual EXV step position (20-450, 300) |
 | 0x0045-0x0048 | -1, -1, 0x7fff, -1 | manual aux valve, manual frequency 2, manual EXV 2, manual aux valve 2 (second circuit, not fitted) |
 | 0x0049 | 500 | manual fan speed |

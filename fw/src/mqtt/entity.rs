@@ -79,12 +79,14 @@ pub enum Kind {
     Switch,
     /// `select` over heat / cool / auto.
     Mode,
-    /// `number` in whole degrees, with the manual's inclusive range.
+    /// `number` in whole units, with an inclusive range.
     Number {
-        /// Lowest value the manual allows.
+        /// Lowest value accepted.
         min: u8,
-        /// Highest value the manual allows.
+        /// Highest value accepted.
         max: u8,
+        /// HA `unit_of_measurement`.
+        unit: &'static str,
     },
     /// `sensor`.
     Sensor {
@@ -184,6 +186,20 @@ const fn counter(object_id: &'static str, name: &'static str) -> Entity {
     }
 }
 
+/// Shorthand for a diagnostic sensor with a unit and no device class.
+const fn measure_diag(object_id: &'static str, name: &'static str, unit: &'static str) -> Entity {
+    Entity {
+        object_id,
+        name,
+        kind: Kind::Sensor {
+            class: None,
+            unit: Some(unit),
+            state_class: Some("measurement"),
+        },
+        diagnostic: true,
+    }
+}
+
 /// Shorthand for a binary sensor row.
 const fn binary(
     object_id: &'static str,
@@ -229,25 +245,65 @@ pub const ENTITIES: &[Entity] = &[
     Entity {
         object_id: "p01",
         name: "Heating setpoint",
-        kind: Kind::Number { min: 8, max: 40 },
+        kind: Kind::Number {
+            min: 8,
+            max: 40,
+            unit: UNIT_CELSIUS,
+        },
         diagnostic: false,
     },
     Entity {
         object_id: "p02",
         name: "Cooling setpoint",
-        kind: Kind::Number { min: 8, max: 28 },
+        kind: Kind::Number {
+            min: 8,
+            max: 28,
+            unit: UNIT_CELSIUS,
+        },
         diagnostic: false,
     },
     Entity {
         object_id: "p03",
         name: "Auto setpoint",
-        kind: Kind::Number { min: 8, max: 40 },
+        kind: Kind::Number {
+            min: 8,
+            max: 40,
+            unit: UNIT_CELSIUS,
+        },
         diagnostic: false,
     },
     Entity {
         object_id: "p04",
         name: "Restart hysteresis",
-        kind: Kind::Number { min: 1, max: 18 },
+        kind: Kind::Number {
+            min: 1,
+            max: 18,
+            unit: UNIT_CELSIUS,
+        },
+        diagnostic: false,
+    },
+    // --- Manual compressor frequency (ADR 0007) ---
+    // Commands go to the manual-frequency manager, not straight to the bus:
+    // `30`..`90` or `off`, renewed at least every 180 s (the lease).
+    Entity {
+        object_id: "manual_hz",
+        name: "Manual frequency",
+        kind: Kind::Number {
+            min: 30,
+            max: 90,
+            unit: "Hz",
+        },
+        diagnostic: false,
+    },
+    binary("manual_freq", "Manual frequency active", None, false),
+    Entity {
+        object_id: "manual_reason",
+        name: "Manual frequency reason",
+        kind: Kind::Sensor {
+            class: None,
+            unit: None,
+            state_class: None,
+        },
         diagnostic: false,
     },
     // --- Sensors A01-A14 plus the target frequency ---
@@ -324,6 +380,7 @@ pub const ENTITIES: &[Entity] = &[
     counter("timeouts", "Bus timeouts"),
     counter("writes", "Block writes"),
     counter("write_failures", "Failed commands"),
+    measure_diag("manual_lease_s", "Manual frequency lease", "s"),
 ];
 
 /// Write the retained discovery topic of one entity:
@@ -400,10 +457,10 @@ pub fn write_discovery(
              \"state_on\":\"{PAYLOAD_ON}\",\"state_off\":\"{PAYLOAD_OFF}\""
         )?,
         Kind::Mode => out.write_str(",\"options\":[\"heat\",\"cool\",\"auto\"]")?,
-        Kind::Number { min, max } => write!(
+        Kind::Number { min, max, unit } => write!(
             out,
             ",\"min\":{min},\"max\":{max},\"step\":1,\"mode\":\"box\",\
-             \"unit_of_measurement\":\"{UNIT_CELSIUS}\""
+             \"unit_of_measurement\":\"{unit}\""
         )?,
         Kind::Sensor {
             class,
@@ -486,11 +543,34 @@ pub fn parse_set(object: &str, payload: &str) -> Result<Command, &'static str> {
         "p02" => degrees(payload).map(Command::SetCoolSetpoint),
         "p03" => degrees(payload).map(Command::SetAutoSetpoint),
         "p04" => degrees(payload).map(Command::SetHysteresis),
+        // Not a bus command: see [`parse_manual`].
+        "manual_hz" => Err("manual_hz is a request to the manager, not a command"),
         // Unreachable while every writable row above is handled; a new
         // writable row without a parser lands here instead of silently
         // becoming a wrong command.
         _ => Err("no parser for this entity"),
     }
+}
+
+/// The payload of `wfi028t/manual_hz/set`: a whole number of Hz (`.0`
+/// tolerated, as for the setpoints), or `off` (case-insensitive). The range
+/// is checked by the manager.
+///
+/// # Errors
+///
+/// Anything else.
+pub fn parse_manual(payload: &str) -> Result<Option<u8>, &'static str> {
+    if payload.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let (whole, fraction) = payload.split_once('.').unwrap_or((payload, ""));
+    if !fraction.bytes().all(|b| b == b'0') {
+        return Err("fractional Hz are not settable");
+    }
+    whole
+        .parse::<u8>()
+        .map(Some)
+        .map_err(|_| "expected a whole number of Hz or off")
 }
 
 fn on_off(payload: &str) -> Result<bool, &'static str> {
@@ -530,8 +610,8 @@ fn degrees(payload: &str) -> Result<u8, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_object, parse_set, write_command_topic, write_discovery, write_discovery_topic,
-        Entity, Kind, ENTITIES,
+        command_object, parse_manual, parse_set, write_command_topic, write_discovery,
+        write_discovery_topic, Entity, Kind, ENTITIES,
     };
     use hp_model::settings::Mode;
     use hp_model::Command;
@@ -569,9 +649,10 @@ mod tests {
             }
         }
         // The register map's Target section, counted: 8 controls, 15 sensors,
-        // 7 status bits, 6 diagnostics.
-        assert_eq!(ENTITIES.len(), 36);
-        assert_eq!(ENTITIES.iter().filter(|e| e.kind.writable()).count(), 8);
+        // 7 status bits, 6 diagnostics; plus manual frequency (ADR 0007):
+        // the number, its bit, its reason and its lease.
+        assert_eq!(ENTITIES.len(), 40);
+        assert_eq!(ENTITIES.iter().filter(|e| e.kind.writable()).count(), 9);
     }
 
     #[test]
@@ -747,12 +828,30 @@ mod tests {
     }
 
     #[test]
+    fn manual_payloads_parse_strictly() {
+        assert_eq!(parse_manual("off"), Ok(None));
+        assert_eq!(parse_manual("OFF"), Ok(None));
+        assert_eq!(parse_manual("45"), Ok(Some(45)));
+        assert_eq!(parse_manual("45.0"), Ok(Some(45)));
+        assert!(parse_manual("45.5").is_err());
+        assert!(parse_manual("-1").is_err());
+        assert!(parse_manual("ON").is_err());
+        assert!(parse_manual("").is_err());
+        // Out of range is the manager's call, not the parser's.
+        assert_eq!(parse_manual("200"), Ok(Some(200)));
+    }
+
+    #[test]
     fn writable_kinds_are_exactly_the_controls() {
         for entity in ENTITIES {
             let writable = matches!(entity.kind, Kind::Switch | Kind::Mode | Kind::Number { .. });
             assert_eq!(entity.kind.writable(), writable);
-            // Every writable entity has a working parser.
-            if writable {
+            // Every writable entity has a working parser; manual_hz's is
+            // parse_manual, because it is a request, not a bus command.
+            if writable && entity.object_id == "manual_hz" {
+                assert_eq!(parse_manual("40"), Ok(Some(40)));
+                assert!(parse_set(entity.object_id, "40").is_err());
+            } else if writable {
                 assert!(
                     parse_set(entity.object_id, "ON").is_ok()
                         || parse_set(entity.object_id, "heat").is_ok()

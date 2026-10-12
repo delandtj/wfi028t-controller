@@ -80,6 +80,7 @@ use sniffer::{BusConfig, BusFormat, Chunk, Line, Marker, SnifferBus};
 
 mod cmd;
 mod led;
+mod manual;
 mod master;
 mod mqtt;
 mod net;
@@ -410,6 +411,7 @@ async fn main(spawner: Spawner) {
                 skip_silence_check: boot.skip_silence_check,
             },
         );
+        manual::start(&spawner);
     }
     #[cfg(feature = "selftest")]
     {

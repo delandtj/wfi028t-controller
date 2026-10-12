@@ -40,6 +40,7 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
+pub mod manual;
 pub mod rtu;
 pub mod settings;
 pub mod status;

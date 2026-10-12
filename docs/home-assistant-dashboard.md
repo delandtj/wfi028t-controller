@@ -32,6 +32,8 @@ name. Renaming an `Entity::name` does not move an entity.
 | `number.wfi028t_p02` | Cooling setpoint, 8-28 |
 | `number.wfi028t_p03` | Auto setpoint, 8-40 |
 | `number.wfi028t_p04` | Restart hysteresis, 1-18 |
+| `number.wfi028t_manual_hz` | Manual compressor frequency, 30-90 Hz or `off`; a lease, resend within 180 s (ADR 0007) |
+| `binary_sensor.wfi028t_manual_freq`, `sensor.wfi028t_manual_reason` | Manual frequency active, and why not (`-`, `lease`, `boot`, `power`, `mode`, `fault`, `setpoint`) |
 | `sensor.wfi028t_inlet_water`, `..._outlet_water`, `..._ambient` | Temperatures |
 | `sensor.wfi028t_exhaust`, `..._gas_return` | Refrigerant temperatures |
 | `sensor.wfi028t_outer_piping`, `..._inner_piping`, `..._radiator` | Coil temperatures |
@@ -44,6 +46,7 @@ name. Renaming an `Entity::name` does not move an entity.
 | `binary_sensor.wfi028t_link` | Modbus link, diagnostic |
 | `sensor.wfi028t_controller_mode`, `..._last_command` | Controller diagnostics |
 | `sensor.wfi028t_requests`, `..._timeouts`, `..._writes`, `..._write_failures` | Bus counters |
+| `sensor.wfi028t_manual_lease_s` | Seconds left on the manual-frequency lease, diagnostic |
 
 Entities whose ids predate the `object_id` field keep the id they were given:
 HA reads `object_id` only when it first registers an entity. To adopt the

@@ -981,6 +981,10 @@ async fn on_message(
         )
         .await;
     }
+    if object == "manual_hz" {
+        return manual_message(client, session, snapshots, text).await;
+    }
+
     let command = match entity::parse_set(object, text) {
         Ok(command) => command,
         Err(reason) => {
@@ -1021,6 +1025,37 @@ async fn on_message(
     // No optimistic state: the entity moves when the heat pump's own readback
     // says so, which is what the next snapshot carries. The outcome arrives
     // on OUTCOMES and lands in the diagnostic sensor.
+    Ok(())
+}
+
+/// `wfi028t/manual_hz/set`: a request to the manual-frequency manager. HA
+/// sends it every 30-60 s as the lease renewal, so an accepted request is not
+/// logged or reported (that would be a note a minute); refusals are, like any
+/// other command's.
+async fn manual_message(
+    client: &mut Mqtt<'_, '_>,
+    session: &mut Session,
+    snapshots: &mut master::SnapshotReceiver,
+    text: &str,
+) -> Result<(), Trouble> {
+    let hz = match entity::parse_manual(text) {
+        Ok(hz) => hz,
+        Err(reason) => return refuse(client, session, snapshots, "manual_hz", text, reason).await,
+    };
+    if master::mode() != OpMode::Master {
+        return refuse(
+            client,
+            session,
+            snapshots,
+            "manual_hz",
+            text,
+            "controller is in listen mode",
+        )
+        .await;
+    }
+    if let Err(reason) = crate::manual::request(hz, hp_model::manual::LEASE_MQTT_MS) {
+        return refuse(client, session, snapshots, "manual_hz", text, reason).await;
+    }
     Ok(())
 }
 
@@ -1106,7 +1141,10 @@ impl Session {
 
     /// The pure view [`json::write_state`] builds the document from.
     fn view<'a>(&'a self, snapshot: Option<&'a Snapshot>) -> json::View<'a> {
+        let manual = crate::manual::view();
         json::View {
+            manual_reason: manual.reason.as_str(),
+            manual_lease_s: manual.lease_s,
             status: snapshot.and_then(|s| s.status.as_ref()),
             settings: snapshot.and_then(|s| s.settings.as_ref()),
             link_up: snapshot.is_some_and(|s| s.link == LinkState::Up),

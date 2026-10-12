@@ -147,10 +147,11 @@ pub enum Command {
     SetAutoSetpoint(u8),
     /// P04, 1-18 C.
     SetHysteresis(u8),
-    /// 0x003f bit 1: manual compressor frequency on/off. Bench test only.
-    SetManualFreq(bool),
-    /// 0x0043: manual compressor frequency, 30-90 Hz. Bench test only.
-    SetManualFreqHz(u8),
+    /// Manual compressor frequency (ADR 0007): `Some(hz)` writes 0x0043 and
+    /// sets 0x003f bit 1 in the same block, 30-90 Hz; `None` clears bit 1
+    /// and leaves 0x0043 alone. Sent by the firmware's manual-frequency
+    /// manager, which owns the lease and the safety rules.
+    SetManualFreq(Option<u8>),
 }
 
 /// Why a [`Command`] did not produce a new block.
@@ -349,7 +350,12 @@ impl Settings {
     /// [`Rejected::UnsupportedMode`] for [`Mode::Other`].
     pub fn apply(&self, command: Command) -> Result<Self, Rejected> {
         match command {
-            Command::SetPower(on) => Ok(self.with_flag(BIT_POWER, on)),
+            // Off also ends manual frequency, in the same write, so the unit
+            // can never come back on at a fixed frequency (ADR 0007).
+            Command::SetPower(true) => Ok(self.with_flag(BIT_POWER, true)),
+            Command::SetPower(false) => Ok(self
+                .with_flag(BIT_POWER, false)
+                .with_flag(BIT_MANUAL_FREQ, false)),
             // Inverted: the ECO bit is clear while full power runs.
             Command::SetBoost(on) => Ok(self.with_flag(BIT_ECO, !on)),
             Command::SetStopAtTarget(on) => Ok(self.with_flag(BIT_STOP_AT_TARGET, on)),
@@ -364,8 +370,10 @@ impl Settings {
             Command::SetCoolSetpoint(c) => self.with_field(Field::CoolSetpoint, c),
             Command::SetAutoSetpoint(c) => self.with_field(Field::AutoSetpoint, c),
             Command::SetHysteresis(c) => self.with_field(Field::Hysteresis, c),
-            Command::SetManualFreq(on) => Ok(self.with_flag(BIT_MANUAL_FREQ, on)),
-            Command::SetManualFreqHz(hz) => self.with_field(Field::ManualFreq, hz),
+            Command::SetManualFreq(None) => Ok(self.with_flag(BIT_MANUAL_FREQ, false)),
+            Command::SetManualFreq(Some(hz)) => Ok(self
+                .with_field(Field::ManualFreq, hz)?
+                .with_flag(BIT_MANUAL_FREQ, true)),
         }
     }
 
@@ -467,16 +475,30 @@ mod tests {
 
     #[test]
     fn manual_frequency_touches_bit_1_and_0x0043_only() {
-        let on = snap().apply(Command::SetManualFreq(true)).unwrap();
+        // On: value and bit in one block.
+        let on = snap().apply(Command::SetManualFreq(Some(75))).unwrap();
         assert_eq!(on.reg(0x003f), Some(0x1073));
         assert!(on.manual_freq());
-        assert_eq!(on.diff(&snap()).count(), 1);
+        assert_eq!(on.manual_freq_hz(), 75);
+        assert_eq!(on.diff(&snap()).count(), 2);
 
-        let hz = snap().apply(Command::SetManualFreqHz(75)).unwrap();
-        assert_eq!(hz.manual_freq_hz(), 75);
-        assert_eq!(hz.diff(&snap()).count(), 1);
-        assert!(snap().apply(Command::SetManualFreqHz(29)).is_err());
-        assert!(snap().apply(Command::SetManualFreqHz(91)).is_err());
+        // Off: the bit only; 0x0043 keeps its value.
+        let off = on.apply(Command::SetManualFreq(None)).unwrap();
+        assert_eq!(off.reg(0x003f), Some(0x1071));
+        assert_eq!(off.manual_freq_hz(), 75);
+
+        assert!(snap().apply(Command::SetManualFreq(Some(29))).is_err());
+        assert!(snap().apply(Command::SetManualFreq(Some(91))).is_err());
+    }
+
+    #[test]
+    fn power_off_also_ends_manual_frequency() {
+        let manual = snap().apply(Command::SetManualFreq(Some(40))).unwrap();
+        let off = manual.apply(Command::SetPower(false)).unwrap();
+        assert_eq!(off.reg(0x003f), Some(0x1070));
+        // Power on does not bring it back.
+        let on = off.apply(Command::SetPower(true)).unwrap();
+        assert!(!on.manual_freq());
     }
 
     #[test]
