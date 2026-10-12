@@ -5,7 +5,8 @@ controller with our own Modbus RTU master, following your protocol document
 "Modbus protocol, Zhike inverter pool heat pump, 2022-03-29" (RCDF211268).
 It polls the status block (0x0000-0x003e) and the settings block
 (0x003f-0x0081) once per second and writes the whole settings block with
-function 0x10, three times, like the stock controller.
+function 0x10, three times, like the stock controller. A change of the
+manual frequency value alone (see below) is written once.
 
 We now also use the manual frequency (0x003f bit 1 + 0x0043) to follow the
 available solar power: the compressor frequency is changed a few times an
