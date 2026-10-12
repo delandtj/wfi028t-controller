@@ -1589,6 +1589,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "provision"
+version = "0.1.0"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2224,6 +2228,7 @@ dependencies = [
  "heapless 0.9.3",
  "hp-model",
  "modbus-sniffer-core",
+ "provision",
  "rust-mqtt",
  "sha2 0.10.9",
  "smart-leds",

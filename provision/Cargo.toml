@@ -1,0 +1,7 @@
+[package]
+name = "provision"
+version = "0.1.0"
+edition = "2021"
+description = "Provisioning records and setup-mode responders (ADR 0004)"
+
+[dependencies]

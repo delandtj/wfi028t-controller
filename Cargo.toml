@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hp-model", "fw", "tools/fw-ota"]
+members = ["hp-model", "fw", "tools/fw-ota", "provision"]
 
 [profile.release]
 opt-level = "z"
