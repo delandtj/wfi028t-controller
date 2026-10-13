@@ -70,6 +70,8 @@ class HeatPump:
         self.args = args
         self.reads = 0
         self.writes = 0
+        self.ignore_writes = args.ignore_writes
+        self.ack_only_writes = args.ack_only_writes
 
     def writable(self, start: int, count: int) -> bool:
         return count >= 1 and SETTINGS[0] <= start and start + count <= REG_END
@@ -102,6 +104,16 @@ class HeatPump:
                 return exception(func, 0x03)
             if not self.writable(start, count) or (self.args.block_only and (start, count) != SETTINGS):
                 return exception(func, 0x02)
+            if self.ignore_writes > 0:
+                self.ignore_writes -= 1
+                print(f"{ts()} ignored write {start:#06x} x{count}: no store, no ack "
+                      f"({self.ignore_writes} left)")
+                return None
+            if self.ack_only_writes > 0:
+                self.ack_only_writes -= 1
+                print(f"{ts()} acked write {start:#06x} x{count} WITHOUT storing it "
+                      f"({self.ack_only_writes} left)")
+                return frame(bytes([func]) + pdu[:4])
             self.store(start, [pdu[5 + 2 * i] << 8 | pdu[6 + 2 * i] for i in range(count)])
             return frame(bytes([func]) + pdu[:4])
         if func == 0x06 and len(pdu) == 4:
@@ -144,6 +156,12 @@ def main():
                     help="probability of ignoring a request, to exercise timeouts")
     ap.add_argument("--block-only", action="store_true",
                     help="reject 0x06 and partial 0x10 writes (whole settings block only)")
+    ap.add_argument("--ignore-writes", type=int, default=0, metavar="N",
+                    help="swallow the first N 0x10 writes: not stored, not acked "
+                         "(exercises the controller's write retry after a timeout)")
+    ap.add_argument("--ack-only-writes", type=int, default=0, metavar="N",
+                    help="ack the first N 0x10 writes without storing them "
+                         "(exercises the retry after a readback mismatch)")
     ap.add_argument("--summary", type=float, default=10.0, help="seconds between summaries, 0 = off")
     args = ap.parse_args()
 
