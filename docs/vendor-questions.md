@@ -92,3 +92,13 @@ The questions are in order of importance.
 24. Temperature scaling is not in the document. We found: inlet water
     raw / 10, discharge (A04) raw x 1, most others raw / 2. Is that right
     for all temperature registers?
+
+## 6. Low water temperature
+
+25. In spring the compressor does not start until the pool water reaches
+    about 10 C; the unit stays on standby until then. Is this the E04
+    anti-freeze protection ("ambient/inlet water temp. is too low")? At
+    which inlet water and ambient temperatures does it block the start, and
+    at which does it release? Is that threshold a parameter (user, installer
+    or factory) that can be changed, from the panel or over Modbus? If not,
+    is there another way to heat cold water at the start of the season?
