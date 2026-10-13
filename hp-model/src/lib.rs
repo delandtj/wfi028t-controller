@@ -46,7 +46,7 @@ pub mod settings;
 pub mod status;
 
 pub use rtu::{Error as RtuError, SETTINGS_LEN, SETTINGS_START, SLAVE, STATUS_LEN, STATUS_START};
-pub use settings::{Command, Field, Mode, Rejected, Settings};
+pub use settings::{Command, Field, Mode, Rejected, Settings, Verdict};
 pub use status::{DeciCelsius, Status};
 
 /// The ADR's freshness rule: a settings block older than this must not be

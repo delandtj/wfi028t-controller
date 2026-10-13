@@ -29,9 +29,9 @@ pub const LEASE_CONSOLE_MS: u64 = 600_000;
 /// Smallest change of 0x0043 worth a block write.
 pub const MIN_STEP_HZ: u8 = 3;
 /// Shortest time between two writes of 0x0043. With HA's loop at 30 s this
-/// caps a full sunny day at ~200 frequency writes (each sent once, see
-/// [`crate::Settings::write_repeats`]); at 60 s and three repeats the first
-/// day of Managed made ~120 block writes an hour.
+/// caps a full sunny day at ~200 frequency writes (each sent once, and
+/// repeated only if the readback disagrees); at 60 s and three copies per
+/// change the first day of Managed made ~120 block writes an hour.
 pub const MIN_WRITE_INTERVAL_MS: u64 = 180_000;
 /// After queueing a command, wait this long for its readback before
 /// queueing another. A write takes about 3.5 s including the readback.

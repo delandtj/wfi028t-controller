@@ -19,23 +19,28 @@
 //! rest is spent listening - which is how a second master gets noticed.
 //!
 //! **Writes sit between the polls, they do not replace them.** A settings
-//! change is three whole-block writes 500 ms apart (one for a bare manual
-//! frequency change, ADR 0007); each one goes out in the
-//! idle part of a slot, right after that slot's read has been answered:
+//! change is ONE whole-block write, sent in the idle part of a settings slot
+//! right after that slot's read has been answered, and the next settings read
+//! is its verdict:
 //!
 //! | Slot | Request | Write |
 //! |---|---|---|
-//! | n (settings) | `03 003f 0043` | write 1, immediately after the read |
-//! | n+1 (status) | `03 0000 003f` | write 2 |
-//! | n+2 (settings) | `03 003f 0043` | write 3 |
-//! | n+4 (settings) | `03 003f 0043` | readback verified here |
+//! | n (settings) | `03 003f 0043` | the write, immediately after the read |
+//! | n+1 (status) | `03 0000 003f` | - |
+//! | n+2 (settings) | `03 003f 0043` | readback verified; a retry goes out here |
 //!
-//! The 500 ms spacing of the writes therefore comes from the slot grid itself,
-//! and the heat pump never goes longer without a poll than it does in the
-//! capture - which matters because a silent master is the suspected cause of
-//! E09 (ADR risk "E09 when the master stops"). Writes only start right after a
-//! settings read, so the block we send back is always the one we just read
-//! ([`hp_model::write_allowed`] re-checks the age at the moment of sending).
+//! The stock controller sends every change three times, which the protocol
+//! does not need (RTU frames carry a CRC, the heat pump acks every accepted
+//! write) and the mainboard probably pays for in EEPROM wear. Instead a write
+//! that was not acked, or whose readback does not show it, is re-applied to
+//! that readback and sent again, up to [`WRITE_ATTEMPTS`] times.
+//!
+//! The heat pump therefore never goes longer without a poll than it does in
+//! the capture - which matters because a silent master is the suspected cause
+//! of E09 (ADR risk "E09 when the master stops"). Writes only ever go out
+//! right after a settings read, so the block we send back is always the one we
+//! just read ([`hp_model::write_allowed`] re-checks the age at the moment of
+//! sending).
 //!
 //! # Two masters
 //!
@@ -62,7 +67,7 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant};
 use esp_hal::timer::timg::{MwdtStage, Wdt};
 
-use hp_model::{rtu, Command, Settings, Status};
+use hp_model::{rtu, Command, Settings, Status, Verdict};
 use modbus_sniffer_core as sniffer;
 use sniffer::{BusConfig, Line};
 
@@ -87,9 +92,11 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Consecutive request timeouts before the link counts as down.
 const LINK_DOWN_AFTER: u32 = 3;
 
-/// Whole-block writes per command, like the stock controller. A bare manual
-/// frequency change goes once ([`Settings::write_repeats`]).
-const WRITE_REPEATS: u8 = 3;
+/// Whole-block writes per command before it is reported failed. The first
+/// attempt is the only one in the normal case: a write is repeated only when
+/// it was not acked, or when the settings readback does not show it
+/// ([`Settings::verdict`]).
+const WRITE_ATTEMPTS: u8 = 3;
 
 /// Listen-mode slice: how often the mode request, the bus setting and the
 /// watchdog are serviced while nothing is being transmitted.
@@ -354,9 +361,6 @@ async fn slot(bus: &mut BusUart, st: &mut State) {
     }
     let slot_start = st.slot_start;
     let settings_slot = !st.slot.is_multiple_of(2);
-    if let Some(write) = st.write.as_mut() {
-        write.sent_this_slot = false;
-    }
 
     // 1. The read.
     let request = if settings_slot {
@@ -550,25 +554,25 @@ fn is_foreign_request(frame: &[u8]) -> bool {
 // Master mode: writes
 // ---------------------------------------------------------------------------
 
-/// The whole-block write for one command: three times, or once for a bare
-/// frequency change.
+/// The whole-block write for one command: once, then verified, then at most
+/// [`WRITE_ATTEMPTS`] - 1 retries re-applied to the readback.
 #[derive(Debug, Clone, Copy)]
 struct Write {
     command: Command,
-    /// The block as read, before the command was applied.
+    /// The block this attempt was applied to (the readback it came from).
     base: Settings,
-    /// The block as sent.
+    /// The block this attempt sent.
     wanted: Settings,
-    /// Writes sent so far.
-    sent: u8,
-    /// Acks received so far.
-    acked: u8,
-    /// Writes to send: [`WRITE_REPEATS`], or 1 for a bare frequency change.
-    repeats: u8,
-    /// All writes are out; the next settings read decides the outcome.
+    /// Attempts started so far, 1..=[`WRITE_ATTEMPTS`].
+    attempt: u8,
+    /// This attempt's write was acked. Only names the reason in the retry
+    /// note; the readback decides.
+    acked: bool,
+    /// Any attempt was acked. Decides [`CommandOutcome::NoAck`] against
+    /// [`CommandOutcome::ReadbackMismatch`] if all attempts fail.
+    ever_acked: bool,
+    /// The write is out; the next settings read decides the outcome.
     verifying: bool,
-    /// One write per slot: set when this slot's write has gone out.
-    sent_this_slot: bool,
     /// Settings slots that went by without an answer while verifying.
     verify_misses: u8,
 }
@@ -608,29 +612,35 @@ async fn write_step(bus: &mut BusUart, st: &mut State, fresh_settings: bool) -> 
             if write.verifying {
                 write.verify_misses += 1;
                 if write.verify_misses >= VERIFY_ATTEMPTS {
-                    let command = write.command;
+                    let (command, ever_acked) = (write.command, write.ever_acked);
                     st.write = None;
                     crate::publish_note(format_args!(
                         "readback not available: {VERIFY_ATTEMPTS} settings polls unanswered"
                     ));
                     st.report(CommandReport {
                         command,
-                        outcome: CommandOutcome::ReadbackMismatch,
+                        outcome: if ever_acked {
+                            CommandOutcome::ReadbackMismatch
+                        } else {
+                            CommandOutcome::NoAck
+                        },
                     });
                 }
             }
         }
     }
 
+    // One write per slot, always right after a settings read: the attempt is
+    // set to verifying the moment it goes out, and only a readback can clear
+    // that again.
     let frame = {
         let Some(write) = st.write.as_mut() else {
             return Answer::Ok;
         };
-        if write.verifying || write.sent >= write.repeats || write.sent_this_slot {
+        if write.verifying {
             return Answer::Ok;
         }
-        write.sent += 1;
-        write.sent_this_slot = true;
+        write.verifying = true;
         write.wanted.write_request()
     };
     st.counters.requests += 1;
@@ -641,26 +651,14 @@ async fn write_step(bus: &mut BusUart, st: &mut State, fresh_settings: bool) -> 
     match wait_for(bus, st, Reply::WriteAck, deadline).await {
         Answer::Ok => {
             if let Some(write) = st.write.as_mut() {
-                write.acked += 1;
+                write.acked = true;
+                write.ever_acked = true;
             }
         }
+        // Not acked, but the write may still have landed: the next settings
+        // read decides, as it does for an acked write.
         Answer::Timeout => st.timeout(bus),
         Answer::Foreign => return Answer::Foreign,
-    }
-
-    // Last write out: the next settings poll is the verdict.
-    if let Some(write) = st.write.as_mut() {
-        if write.sent >= write.repeats {
-            write.verifying = true;
-            if write.acked == 0 {
-                let report = CommandReport {
-                    command: write.command,
-                    outcome: CommandOutcome::NoAck,
-                };
-                st.write = None;
-                st.report(report);
-            }
-        }
     }
     Answer::Ok
 }
@@ -685,20 +683,18 @@ fn start_write(st: &mut State, fresh: Settings) {
         Ok(wanted) => {
             let mut line = Line::new();
             let _ = write_command(&mut line, &command);
-            let repeats = fresh.write_repeats(&wanted).min(WRITE_REPEATS);
             crate::publish_note(format_args!(
-                "write {line}: {} registers, {repeats} times, settings age {age} ms",
+                "write {line}: {} registers, once, settings age {age} ms",
                 fresh.diff(&wanted).count()
             ));
             st.write = Some(Write {
                 command,
                 base: fresh,
                 wanted,
-                sent: 0,
-                acked: 0,
-                repeats,
+                attempt: 1,
+                acked: false,
+                ever_acked: false,
                 verifying: false,
-                sent_this_slot: false,
                 verify_misses: 0,
             });
         }
@@ -709,38 +705,103 @@ fn start_write(st: &mut State, fresh: Settings) {
     }
 }
 
-/// Compare the settings block that just came back with what we wrote.
+/// Judge the settings block that just came back: the command is done, gets
+/// one more attempt, or has failed.
+///
+/// The verdict comes from re-applying the command to the readback
+/// ([`Settings::verdict`]), so a write that was not acked but landed anyway
+/// counts as applied, and a retry carries the readback's own values for every
+/// register the command does not touch.
 fn verify(st: &mut State, got: Settings) {
     let Some(write) = st.write else {
         return;
     };
-    st.write = None;
+    report_foreign_changes(&write, &got);
 
-    // Only the registers the command was meant to change have to match.
+    let wanted = match got.verdict(write.command) {
+        Verdict::Applied => {
+            st.write = None;
+            st.report(CommandReport {
+                command: write.command,
+                outcome: CommandOutcome::Applied,
+            });
+            return;
+        }
+        Verdict::Rejected(reason) => {
+            st.write = None;
+            crate::publish_note(format_args!(
+                "readback: the command no longer applies to this block"
+            ));
+            st.report(CommandReport {
+                command: write.command,
+                outcome: CommandOutcome::Rejected(reason),
+            });
+            return;
+        }
+        Verdict::Rewrite(wanted) => wanted,
+    };
+
+    // Registers the command asked for that the readback does not hold.
     let mut mismatch = 0usize;
     let mut line = Line::new();
-    for (addr, _, wanted) in write.base.diff(&write.wanted) {
-        if got.reg(addr) != Some(wanted) {
-            if mismatch < MAX_REPORTED_REGS {
-                let actual = got.reg(addr).unwrap_or(0);
-                let _ = write!(line, " 0x{addr:04x} want {wanted} got {actual}");
-            }
-            mismatch += 1;
+    for (addr, actual, want) in got.diff(&wanted) {
+        if mismatch < MAX_REPORTED_REGS {
+            let _ = write!(line, " 0x{addr:04x} want {want} got {actual}");
         }
+        mismatch += 1;
+    }
+    let why = if write.acked {
+        "readback mismatch"
+    } else {
+        "no ack"
+    };
+
+    if write.attempt >= WRITE_ATTEMPTS {
+        st.write = None;
+        crate::publish_note(format_args!(
+            "write failed after {WRITE_ATTEMPTS} attempts, {why} on {mismatch} register(s):{line}"
+        ));
+        st.report(CommandReport {
+            command: write.command,
+            outcome: if write.ever_acked {
+                CommandOutcome::ReadbackMismatch
+            } else {
+                CommandOutcome::NoAck
+            },
+        });
+        return;
     }
 
-    // Registers the heat pump changed by itself between our write and this
-    // read. Not a failure - the stock controller has the same race - but worth
-    // naming, because it is the open question in the ADR about whole-block
-    // writes.
-    // A register differs from what we sent and we did not touch it (we sent
-    // back what we had just read): the heat pump moved it itself.
+    // One more attempt, built on the block we just read. It goes out in the
+    // idle part of this very slot, right after the read it is based on.
+    let mut cmd = Line::new();
+    let _ = write_command(&mut cmd, &write.command);
+    crate::publish_note(format_args!(
+        "write retry {}/{WRITE_ATTEMPTS} {cmd}: {why} on {mismatch} register(s):{line}",
+        write.attempt + 1
+    ));
+    st.write = Some(Write {
+        base: got,
+        wanted,
+        attempt: write.attempt + 1,
+        acked: false,
+        verifying: false,
+        verify_misses: 0,
+        ..write
+    });
+}
+
+/// Name the registers the heat pump moved by itself between our write and this
+/// read. Not a failure - the stock controller has the same race - but worth
+/// naming, because it is the open question in the ADR about whole-block
+/// writes.
+fn report_foreign_changes(write: &Write, got: &Settings) {
     let mut foreign_changes = Line::new();
     let mut foreign_count = 0usize;
-    for (addr, sent, actual) in write.wanted.diff(&got) {
+    for (addr, sent, actual) in write.wanted.diff(got) {
         if write.base.reg(addr) != Some(sent) {
-            // One of the registers the command changed; the mismatch loop
-            // above owns that case.
+            // One of the registers the command changed; the verdict above
+            // owns that case.
             continue;
         }
         if foreign_count < MAX_REPORTED_REGS {
@@ -753,19 +814,6 @@ fn verify(st: &mut State, got: Settings) {
             "readback: heat pump changed {foreign_count} other register(s):{foreign_changes}"
         ));
     }
-
-    let outcome = if mismatch == 0 {
-        CommandOutcome::Applied
-    } else {
-        crate::publish_note(format_args!(
-            "readback mismatch on {mismatch} register(s):{line}"
-        ));
-        CommandOutcome::ReadbackMismatch
-    };
-    st.report(CommandReport {
-        command: write.command,
-        outcome,
-    });
 }
 
 // ---------------------------------------------------------------------------

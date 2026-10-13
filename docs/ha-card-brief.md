@@ -306,12 +306,15 @@ number's own `min`/`max` attributes.
    4). Nothing is echoed back.
 2. The bus master takes one command per 1 s cycle, right after a fresh
    settings read (settings older than 2 s are refused). It writes the whole
-   settings block three times over three 500 ms slots, then verifies with
-   the next settings read.
+   settings block ONCE, then verifies with the next settings read. If that
+   readback does not show the change (or the write was not acked), the
+   command is re-applied to the readback and written again, at most 3
+   attempts in total, one per 1 s cycle.
 3. The entity's own state usually changes within about 1-2 s, when the
    settings poll sees the new value.
-4. `last_command` gets the outcome in about 2.5-3.5 s. An MQTT-layer
-   refusal (section below) lands at once, well under a second.
+4. `last_command` gets the outcome in about 1.5-2.5 s, or about a second
+   later per retry. An MQTT-layer refusal (section below) lands at once,
+   well under a second.
 
 A card pending timeout of about 8 s is reasonable; after it, show "no
 response". Nothing short of a lost MQTT message or a controller reboot
@@ -336,8 +339,8 @@ Bus outcomes:
 | `ok` | written, acknowledged, verified on readback |
 | `rejected` | model refused the value; detail like `(30 outside 8..=28)` or `(mode 0x.... not supported)` |
 | `no-fresh-settings` | Modbus link down or settings stale; nothing written |
-| `no-ack` | none of the three writes was acknowledged |
-| `readback-mismatch` | acknowledged but not seen in the next settings read |
+| `no-ack` | no attempt was acknowledged (up to 3) |
+| `readback-mismatch` | acknowledged but still not in the settings read after the last attempt |
 | `not-master` | controller left master mode before or during the write |
 | `rebooting` | firmware update reboot in progress |
 

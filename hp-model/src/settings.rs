@@ -174,6 +174,21 @@ pub enum Rejected {
     UnsupportedMode(u16),
 }
 
+/// What the settings readback that follows a command write means for that
+/// command. See [`Settings::verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The readback holds everything the command asked for: done, whether or
+    /// not the write was acked.
+    Applied,
+    /// It does not: the command re-applied to the readback, to be written
+    /// again (up to the caller's attempt limit).
+    Rewrite(Settings),
+    /// The command cannot be applied to the readback at all, which only a
+    /// heat pump that moved into another state can cause.
+    Rejected(Rejected),
+}
+
 /// Decoded view of the settings block, and the source of every write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
@@ -221,7 +236,8 @@ impl Settings {
 
     /// The whole-block write frame for this block:
     /// `01 10 003f 0043 86 <134 bytes> <crc>`. The stock controller sends it
-    /// three times, 500 ms apart.
+    /// three times, 500 ms apart; we send it once and check the next
+    /// settings readback ([`Settings::verdict`]).
     #[must_use]
     pub fn write_request(&self) -> [u8; SETTINGS_WRITE_LEN] {
         rtu::write_settings_request(&self.raw)
@@ -377,18 +393,22 @@ impl Settings {
         }
     }
 
-    /// How many times to send the whole-block write that turns this block
-    /// into `wanted`: three, like the stock controller, except for a change
-    /// of the manual frequency value (0x0043) alone, which goes once. Those
-    /// come from a control loop many times an hour, and the block probably
-    /// lives in EEPROM (ADR 0007); a lost one is re-sent by the manager when
-    /// the readback does not show it.
+    /// What this block, just read back after a command was written, means for
+    /// that command.
+    ///
+    /// Every command is written once and verified by the next settings read.
+    /// The verdict is decided by re-applying the command to the readback
+    /// itself: if that changes nothing, the heat pump already holds what was
+    /// asked for ([`Verdict::Applied`]); if it does, the readback is the
+    /// freshest block there is, so the re-applied copy is what has to go out
+    /// again ([`Verdict::Rewrite`]) and a register the heat pump moved
+    /// meanwhile is not clobbered.
     #[must_use]
-    pub fn write_repeats(&self, wanted: &Self) -> u8 {
-        let mut changed = self.diff(wanted).map(|(addr, _, _)| addr);
-        match (changed.next(), changed.next()) {
-            (Some(REG_MANUAL_FREQ), None) => 1,
-            _ => 3,
+    pub fn verdict(&self, command: Command) -> Verdict {
+        match self.apply(command) {
+            Ok(wanted) if self.diff(&wanted).next().is_none() => Verdict::Applied,
+            Ok(wanted) => Verdict::Rewrite(wanted),
+            Err(reason) => Verdict::Rejected(reason),
         }
     }
 
@@ -428,7 +448,10 @@ pub(crate) mod snapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{snapshot::SETTINGS_BLOCK, Command, Field, Mode, Rejected, Settings};
+    use super::{
+        snapshot::SETTINGS_BLOCK, Command, Field, Mode, Rejected, Settings, Verdict,
+        REG_MANUAL_FREQ,
+    };
     use crate::rtu::{
         self, test_support, SETTINGS_LEN, SETTINGS_RESPONSE_LEN, SETTINGS_START, SETTINGS_WRITE_LEN,
     };
@@ -507,19 +530,98 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bare_frequency_change_is_written_once() {
-        let off = snap();
-        let on = off.apply(Command::SetManualFreq(Some(45))).unwrap();
-        let moved = on.apply(Command::SetManualFreq(Some(40))).unwrap();
-        // Bit and value together: the usual three.
-        assert_eq!(off.write_repeats(&on), 3);
-        // Value alone, bit already set: once.
-        assert_eq!(on.write_repeats(&moved), 1);
-        // Clearing the bit, and everything else: three.
-        let cleared = moved.apply(Command::SetManualFreq(None)).unwrap();
-        assert_eq!(moved.write_repeats(&cleared), 3);
-        let p01 = off.apply(Command::SetHeatSetpoint(34)).unwrap();
-        assert_eq!(off.write_repeats(&p01), 3);
+    fn a_readback_that_holds_the_command_is_applied() {
+        let base = snap();
+        for command in [
+            Command::SetHeatSetpoint(34),
+            Command::SetPower(false),
+            Command::SetBoost(true),
+            Command::SetMode(Mode::Cool),
+            Command::SetManualFreq(Some(45)),
+            Command::SetManualFreq(None),
+        ] {
+            let wrote = base.apply(command).unwrap();
+            // The block came back exactly as written.
+            assert_eq!(wrote.verdict(command), Verdict::Applied, "{command:?}");
+            // And again when the heat pump moved a register we did not touch:
+            // only the command's own registers decide.
+            let moved = wrote.with_word_at(0x0050, 0x1234);
+            assert_eq!(moved.verdict(command), Verdict::Applied, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_readback_without_the_command_is_rewritten_from_itself() {
+        let base = snap();
+        let command = Command::SetHeatSetpoint(34);
+        // The write was lost: P01 still 33, and the heat pump moved 0x0050
+        // meanwhile.
+        let lost = base.with_word_at(0x0050, 0x1234);
+        let Verdict::Rewrite(again) = lost.verdict(command) else {
+            panic!("a lost write has to be rewritten");
+        };
+        // The rewrite is the readback plus the command, so 0x0050 keeps the
+        // heat pump's value instead of being clobbered with the old one.
+        assert_eq!(again.heat_setpoint(), 34);
+        assert_eq!(again.reg(0x0050), Some(0x1234));
+        assert_eq!(lost.diff(&again).count(), 1);
+        assert_eq!(again.verdict(command), Verdict::Applied);
+    }
+
+    #[test]
+    fn a_partly_applied_readback_is_rewritten() {
+        // Manual frequency is value plus bit: the heat pump taking only the
+        // value is not Applied.
+        let base = snap();
+        let command = Command::SetManualFreq(Some(45));
+        let half = base.with_word_at(REG_MANUAL_FREQ, 45);
+        let Verdict::Rewrite(again) = half.verdict(command) else {
+            panic!("a half-applied write has to be rewritten");
+        };
+        assert!(again.manual_freq());
+        assert_eq!(again.manual_freq_hz(), 45);
+        assert_eq!(half.diff(&again).count(), 1);
+    }
+
+    #[test]
+    fn three_attempts_walk_the_firmware_s_retry_loop() {
+        // What fw/src/poll.rs does: write once, judge the readback, re-apply
+        // and write again, at most WRITE_ATTEMPTS times.
+        const ATTEMPTS: u8 = 3;
+        let command = Command::SetHeatSetpoint(36);
+        let mut heat_pump = snap();
+        let mut sent = snap().apply(command).unwrap();
+        let mut attempts = 1u8;
+        loop {
+            // The heat pump swallows the first two writes and takes the
+            // third, and moves a register of its own every poll.
+            if attempts == ATTEMPTS {
+                heat_pump = sent;
+            }
+            heat_pump = heat_pump.with_word_at(0x0050, 0x1000 + u16::from(attempts));
+            match heat_pump.verdict(command) {
+                Verdict::Applied => break,
+                Verdict::Rewrite(again) => {
+                    assert!(attempts < ATTEMPTS, "gave up only after {attempts}");
+                    // The rewrite carries the heat pump's own register.
+                    assert_eq!(again.reg(0x0050), heat_pump.reg(0x0050));
+                    sent = again;
+                    attempts += 1;
+                }
+                Verdict::Rejected(_) => panic!("not a rejection"),
+            }
+        }
+        assert_eq!(attempts, ATTEMPTS);
+        assert_eq!(heat_pump.heat_setpoint(), 36);
+    }
+
+    #[test]
+    fn a_readback_the_command_no_longer_fits_is_rejected() {
+        let mode = snap().with_word_at(0x0040, 5);
+        assert_eq!(
+            mode.verdict(Command::SetMode(Mode::Other(5))),
+            Verdict::Rejected(Rejected::UnsupportedMode(5))
+        );
     }
 
     #[test]

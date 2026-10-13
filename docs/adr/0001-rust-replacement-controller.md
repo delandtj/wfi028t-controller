@@ -3,6 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-10-03
 **Updated**: 2026-10-03 (review asks settled: MQTT, core as path dependency, wall display dropped; component 3 moved to MQTT 5 via rust-mqtt 0.6)
+**Updated**: 2026-10-13 (component 2: every command is written once and verified by the readback, repeated only if that disagrees - the stock controller's three copies are not a protocol need)
 
 ---
 
@@ -115,8 +116,13 @@ master before raising E09.
    - Request/response with a response timeout (about 500 ms) and t3.5 framing
      reused from the sniffer receiver.
    - Write procedure: take the last settings block (fresh < 2 s), apply the
-     command via the model, send 0x10 three times 500 ms apart, verify the
-     ack each time and the readback on the next poll.
+     command via the model, send 0x10 ONCE, and read the block back on the
+     next settings poll as the verdict. A write that was not acked, or whose
+     readback does not show the change, is re-applied to that readback and
+     sent again, at most 3 attempts in total (2026-10-13: the stock
+     controller's three copies were dropped - the frame has a CRC, the write
+     is acked and we read back anyway, so copies 2 and 3 were only EEPROM
+     wear).
    - Link health: consecutive timeouts -> `link=down`, exposed to MQTT and the
      LED.
    - Interfaces: `Signal<Command>` in, `Watch<Snapshot>` out (latest
@@ -261,9 +267,13 @@ critical path (polling starts before WiFi), so the bus gap after a reset is
 about a second. Not yet known: whether E09 latches and needs a power cycle.
 
 **Q: Why trust the triple write instead of verifying once?**
-A: We do both: three writes like the stock controller, each ack checked, then
-readback on the next poll. If the readback disagrees, the command is reported
-failed to HA and logged; no automatic retry loop beyond that.
+A: We do not (2026-10-13). One write, the ack checked, then the readback on
+the next settings poll. The RTU frame carries a CRC and the heat pump acks
+every accepted write, so the stock controller's copies 2 and 3 add nothing
+but EEPROM wear. If the readback disagrees - or the write was not acked - the
+command is re-applied to that readback and written again, at most 3 attempts
+one second apart; after that it is reported failed to HA and logged, with
+every retry visible in the capture stream.
 
 **Q: Who resolves the conflict if HA and the (unplugged) stock controller
 disagree?**

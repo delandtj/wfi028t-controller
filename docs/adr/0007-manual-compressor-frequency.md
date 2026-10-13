@@ -8,6 +8,8 @@ sensor rides with the counters, console syntax `set mfreq <hz>|off`.
 After the first hour of HA's Managed mode - ~40 frequency changes, ~120
 block writes - the rate limit went to 3 Hz / 3 min and a bare frequency
 change is written once instead of three times)
+**Updated**: 2026-10-13 (writing once is no longer special to the frequency:
+every command is written once and verified by the readback, ADR 0001)
 
 ---
 
@@ -51,9 +53,9 @@ Three properties of the hardware shape it:
 2. **Manual mode probably ignores the setpoint.** Untested; the safe
    assumption is that the mainboard holds the manual frequency regardless of
    the water temperature.
-3. **Every change is a whole-block write, three times**, and the block is
-   most likely kept in EEPROM. A control loop that writes every few seconds
-   could wear it out over a season.
+3. **Every change is a whole-block write** - three times in the stock
+   controller - and the block is most likely kept in EEPROM. A control loop
+   that writes every few seconds could wear it out over a season.
 
 ---
 
@@ -122,10 +124,10 @@ frequency; the firmware decides whether and when that reaches the bus.
      command the manager waits 8 s (`SETTLE_MS`) for the readback before it
      queues another, so a slow write is never queued twice.
    - The rate limit applies to 0x0043 only. A change of 0x0043 alone (bit 1
-     already set) is sent ONCE, not three times
-     (`Settings::write_repeats`); if it is lost, the readback does not show
-     it and the manager queues it again after its settle time. Enabling,
-     disabling and every other command keep the stock controller's three.
+     already set) is sent ONCE, not three times; if it is lost, the readback
+     does not show it and the master writes it again. (2026-10-13: this is
+     now how every command is written - see ADR 0001 component 2 - so the
+     special case is gone with `Settings::write_repeats`.)
      Worst case with a busy HA loop: one block write per 3 min while
      running, about 200 on a 10 h day. The values (3 Hz, 180 s, 180 s
      lease) are constants first; settings only if they turn out to need

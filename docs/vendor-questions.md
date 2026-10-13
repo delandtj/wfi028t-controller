@@ -5,8 +5,10 @@ controller with our own Modbus RTU master, following your protocol document
 "Modbus protocol, Zhike inverter pool heat pump, 2022-03-29" (RCDF211268).
 It polls the status block (0x0000-0x003e) and the settings block
 (0x003f-0x0081) once per second and writes the whole settings block with
-function 0x10, three times, like the stock controller. A change of the
-manual frequency value alone (see below) is written once.
+function 0x10. Unlike the stock controller, which sends every change three
+times, we send each change ONCE and read the block back on the next poll to
+check it; only a write that was not acknowledged, or that the readback does
+not show, is sent again (at most three attempts).
 
 We now also use the manual frequency (0x003f bit 1 + 0x0043) to follow the
 available solar power: the compressor frequency is changed a few times an
@@ -34,8 +36,10 @@ The questions are in order of importance.
 5. What write rate do you consider safe for continuous use: writes per
    hour, or total writes over the life of the board?
 6. The stock controller writes every change three times, 500 ms apart. Is
-   that needed for reliability, or would one write (acknowledged, then
-   checked by reading back) be enough?
+   that needed for reliability, or is one write (acknowledged, then checked
+   by reading back) enough? We now send one, and repeat it only when the
+   readback disagrees - is there any reason on the mainboard side why that
+   would be unsafe?
 7. Function 0x06 (write single register): is it supported for 0x0043, and
    does it cause a smaller or no permanent write compared with 0x10?
 

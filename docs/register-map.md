@@ -45,11 +45,17 @@ firmware does the same.
 | +500 ms | `01 03 003f 0043` - read 67 registers 0x003f-0x0081 (settings block) |
 | ~+660 ms | heat pump reply, 134 data bytes |
 
-On a settings change the controller writes the WHOLE settings block
+On a settings change the stock controller writes the WHOLE settings block
 (`01 10 003f 0043 86 <134 bytes>`) three times, 500 ms apart, each acked by
 the heat pump ~24 ms later with `01 10 003f 0043`. The changed value is
-visible in the next poll. The firmware writes the same way, starting from a
-settings block it read moments before.
+visible in the next poll. The firmware writes the same frame, starting from a
+settings block it read moments before, but sends it ONCE: the frame carries a
+CRC, the ack confirms it and the next settings poll is read back as the
+verdict. Only a write that was not acked, or whose readback does not show the
+change, is sent again - re-applied to that readback, at most 3 attempts in
+total. The three copies are the stock controller's habit; the block most
+likely lives in EEPROM, so the extra two are pure wear (see
+`docs/vendor-questions.md` question 6).
 
 The stock controller also writes the whole block about 3 s after it boots
 (breaker test 2026-10-04, see "Observed sequences"). The heat pump keeps its

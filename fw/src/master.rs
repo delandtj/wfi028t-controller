@@ -174,13 +174,15 @@ impl Snapshot {
 pub enum CommandOutcome {
     /// Written, acked and verified in the readback.
     Applied,
-    /// The model refused the value; nothing was sent.
+    /// The model refused the value; nothing was sent (or, after a readback,
+    /// the command no longer applies to the block the heat pump holds).
     Rejected(Rejected),
     /// No settings block fresh enough to write back (link down, or stale).
     NoFreshSettings,
-    /// None of the three writes was acked.
+    /// No attempt was acked (up to `WRITE_ATTEMPTS`).
     NoAck,
-    /// Acked, but the next settings poll did not show the change.
+    /// Acked, but the settings poll after the last attempt still did not
+    /// show the change.
     ReadbackMismatch,
     /// The firmware is in listen mode and will not transmit.
     NotMaster,
